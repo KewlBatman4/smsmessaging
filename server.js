@@ -135,7 +135,9 @@ app.use(
  *
  * Console: your Conversation Service → Webhooks → Post-Event URL:
  *   https://YOUR-API/api/webhooks/twilio/conversations
- * Enable event: onConversationAdded (and URL must be reachable publicly).
+ * Enable events: onConversationAdded, onMessageAdded (post-event URL must be public).
+ * onMessageAdded covers SMS threads created before this app existed — each new inbound
+ * message adds the browser identity so the inbox can subscribe.
  *
  * Also ensure inbound SMS can reach Conversations (see Twilio "Inbound autocreation"
  * and avoid a conflicting "A message comes in" handler on the number when possible).
@@ -149,7 +151,10 @@ app.post(
     }
     const event = req.body.EventType || req.body.eventType;
     const convSid = req.body.ConversationSid || req.body.conversationSid;
-    if (event === 'onConversationAdded' && convSid) {
+    const shouldEnsure =
+      convSid &&
+      (event === 'onConversationAdded' || event === 'onMessageAdded');
+    if (shouldEnsure) {
       try {
         await ensureChatParticipantInConversation(convSid);
       } catch (e) {
@@ -277,6 +282,41 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   } catch (err) {
     console.error('List conversations error:', err);
     return res.status(500).json({ error: 'Failed to list conversations.' });
+  }
+});
+
+/**
+ * Add the web inbox identity to every Conversation in this service that lacks it.
+ * Use once after deploy or when old SMS-only threads never triggered onConversationAdded.
+ */
+app.post('/api/repair-chat-participants', requireSession, async (_req, res) => {
+  let scanned = 0;
+  let added = 0;
+  try {
+    let page = await twilioClient.conversations.v1
+      .services(serviceSid)
+      .conversations.page({ pageSize: 50 });
+    for (;;) {
+      for (const conv of page.instances) {
+        scanned++;
+        const sid = conv.sid;
+        const parts = await twilioClient.conversations.v1
+          .services(serviceSid)
+          .conversations(sid)
+          .participants.list();
+        const hasOurIdentity = parts.some((p) => p.identity === twilioChatIdentity);
+        if (!hasOurIdentity) {
+          await ensureChatParticipantInConversation(sid);
+          added++;
+        }
+      }
+      if (!page.nextPageUrl) break;
+      page = await page.nextPage();
+    }
+    return res.json({ scanned, added });
+  } catch (err) {
+    console.error('Repair chat participants error:', err);
+    return res.status(500).json({ error: err?.message || 'Repair failed.' });
   }
 });
 
