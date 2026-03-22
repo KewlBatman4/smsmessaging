@@ -107,10 +107,10 @@ async function ensureChatParticipantInConversation(conversationSid) {
   }
 }
 
-function validateTwilioConversationsWebhook(req) {
+function validateTwilioWebhookSignature(req) {
   if (!twilioAuthToken) {
     console.warn(
-      'TWILIO_AUTH_TOKEN not set; Conversations webhook signature verification is disabled.'
+      'TWILIO_AUTH_TOKEN not set; Twilio webhook signature verification is disabled.'
     );
     return true;
   }
@@ -118,6 +118,331 @@ function validateTwilioConversationsWebhook(req) {
   if (!sig) return false;
   const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
   return twilio.validateRequest(twilioAuthToken, sig, url, req.body);
+}
+
+function proxyNumberE164() {
+  const t = twilioPhone.trim();
+  return t.startsWith('+') ? t : `+${t.replace(/\D/g, '')}`;
+}
+
+function digitsOnly(phone) {
+  return String(phone || '').replace(/\D/g, '');
+}
+
+function fromMatchesOurTwilioNumber(from) {
+  return digitsOnly(from) === digitsOnly(twilioPhone);
+}
+
+/** Dedupe Programmable Messaging status callbacks (sent + delivered, retries). */
+const mirroredProgrammableMessageSids = new Set();
+const MIRROR_SID_CAP = 8000;
+function rememberMirroredSid(sid) {
+  mirroredProgrammableMessageSids.add(sid);
+  if (mirroredProgrammableMessageSids.size > MIRROR_SID_CAP) {
+    mirroredProgrammableMessageSids.clear();
+  }
+}
+
+async function listParticipantConversationRowsForAddress(address) {
+  const rows = [];
+  let page = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .participantConversations.page({ address, pageSize: 50 });
+  for (;;) {
+    rows.push(...page.instances);
+    if (!page.nextPageUrl) break;
+    page = await page.nextPage();
+  }
+  return rows;
+}
+
+function pickConversationSidForCustomer(rows) {
+  const active = rows.filter((r) => r.conversationState !== 'closed');
+  const pool = active.length ? active : rows;
+  if (!pool.length) return null;
+  pool.sort(
+    (a, b) =>
+      (b.conversationDateUpdated?.getTime?.() ?? 0) -
+      (a.conversationDateUpdated?.getTime?.() ?? 0)
+  );
+  return pool[0].conversationSid || null;
+}
+
+/**
+ * Create a new SMS conversation with chat + SMS participants (same as POST /api/conversations).
+ */
+async function createSmsConversationForCustomerE164(customerE164) {
+  const proxy = proxyNumberE164();
+  const conversation = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations.create({
+      friendlyName: `SMS ${customerE164}`,
+    });
+  const sid = conversation.sid;
+  await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(sid)
+    .participants.create({ identity: twilioChatIdentity });
+  await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(sid)
+    .participants.create({
+      'messagingBinding.address': customerE164,
+      'messagingBinding.proxyAddress': proxy,
+    });
+  return sid;
+}
+
+/**
+ * Find an existing conversation for this customer address, or create one (Zapier-first outbound).
+ */
+async function findOrCreateConversationForCustomerAddress(customerAddress) {
+  const rows = await listParticipantConversationRowsForAddress(customerAddress);
+  const existing = pickConversationSidForCustomer(rows);
+  if (existing) return existing;
+  const parsed = toE164Australian(customerAddress);
+  const e164 = parsed.ok ? parsed.e164 : customerAddress.trim();
+  return createSmsConversationForCustomerE164(e164);
+}
+
+function parseConversationAttributes(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function mirrorProgrammableOutboundToConversation(
+  conversationSid,
+  bodyText,
+  messageSid,
+  dateCreated
+) {
+  const attrs = JSON.stringify({
+    pbsgOutbound: true,
+    programmaticMessageSid: messageSid,
+  });
+  const params = {
+    author: 'system',
+    body: bodyText,
+    attributes: attrs,
+  };
+  if (dateCreated) params.dateCreated = dateCreated;
+  await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(conversationSid)
+    .messages.create(params);
+}
+
+async function mirrorProgrammableInboundToConversation(
+  conversationSid,
+  bodyText,
+  messageSid,
+  customerE164,
+  dateCreated
+) {
+  const attrs = JSON.stringify({
+    pbsgInbound: true,
+    programmaticMessageSid: messageSid,
+    fromAddress: customerE164,
+  });
+  const params = {
+    author: 'system',
+    body: bodyText,
+    attributes: attrs,
+  };
+  if (dateCreated) params.dateCreated = dateCreated;
+  await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(conversationSid)
+    .messages.create(params);
+}
+
+function rawPhoneFromTwilioAddr(addr) {
+  if (!addr || typeof addr !== 'string') return null;
+  const s = addr.trim();
+  if (s.toLowerCase().startsWith('whatsapp:')) {
+    const rest = s.slice('whatsapp:'.length);
+    return rest.split(':')[0]?.trim() || null;
+  }
+  if (/^[a-z]+:/i.test(s)) return null;
+  return s;
+}
+
+/** Other party’s phone for a classic SMS (From/To includes our Twilio number). */
+function customerAddressForProgrammableSms(msg) {
+  const from = rawPhoneFromTwilioAddr(msg.from);
+  const to = rawPhoneFromTwilioAddr(msg.to);
+  if (!from || !to) return null;
+  if (fromMatchesOurTwilioNumber(from)) return to;
+  if (fromMatchesOurTwilioNumber(to)) return from;
+  return null;
+}
+
+async function conversationAlreadyHasMirroredProgrammableSid(conversationSid, smSid) {
+  let page = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(conversationSid)
+    .messages.page({ order: 'desc', pageSize: 100 });
+  for (let i = 0; i < 10; i++) {
+    for (const msg of page.instances) {
+      const a = parseConversationAttributes(msg.attributes);
+      if (a?.programmaticMessageSid === smSid) return true;
+    }
+    if (!page.nextPageUrl) break;
+    page = await page.nextPage();
+  }
+  return false;
+}
+
+/** Skip mirror when Conversations already has the same inbound from Twilio’s native SMS path. */
+async function likelyNativeInboundDuplicate(conversationSid, bodyText, smDate) {
+  const want = (bodyText || '').trim();
+  if (!want) return false;
+  const smT = smDate?.getTime?.() ?? 0;
+  if (!smT) return false;
+  const page = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(conversationSid)
+    .messages.page({ order: 'desc', pageSize: 40 });
+  for (const msg of page.instances) {
+    const a = parseConversationAttributes(msg.attributes);
+    if (a?.programmaticMessageSid || a?.pbsgOutbound) continue;
+    if ((msg.body || '').trim() !== want) continue;
+    const t = msg.dateCreated?.getTime?.() ?? 0;
+    if (t > 0 && Math.abs(t - smT) < 120_000) return true;
+  }
+  return false;
+}
+
+const SMS_LOG_MAX_PAGES_PER_DIRECTION = 60;
+
+async function pageAllProgrammableMessages(listParams) {
+  const out = [];
+  let page = await twilioClient.messages.page({
+    ...listParams,
+    pageSize: 100,
+  });
+  for (let i = 0; i < SMS_LOG_MAX_PAGES_PER_DIRECTION; i++) {
+    out.push(...page.instances);
+    if (!page.nextPageUrl) break;
+    page = await page.nextPage();
+  }
+  return out;
+}
+
+/**
+ * Pull Twilio Programmable Messaging (SMS log) and append missing rows into Conversations
+ * so the web app can show traffic that never entered the Conversation service.
+ */
+async function syncProgrammableSmsLogIntoConversations(daysBack) {
+  const our = proxyNumberE164();
+  const dateSentAfter = new Date(Date.now() - Math.min(Math.max(daysBack, 1), 90) * 86400000);
+
+  const [toUs, fromUs] = await Promise.all([
+    pageAllProgrammableMessages({ to: our, dateSentAfter }),
+    pageAllProgrammableMessages({ from: our, dateSentAfter }),
+  ]);
+
+  const bySid = new Map();
+  for (const m of toUs) bySid.set(m.sid, m);
+  for (const m of fromUs) bySid.set(m.sid, m);
+  const merged = [...bySid.values()].sort(
+    (a, b) => (a.dateSent?.getTime?.() ?? 0) - (b.dateSent?.getTime?.() ?? 0)
+  );
+
+  let imported = 0;
+  let skipped = 0;
+  const convTouched = new Set();
+
+  for (const sm of merged) {
+    const customer = customerAddressForProgrammableSms(sm);
+    if (!customer) {
+      skipped++;
+      continue;
+    }
+
+    let bodyText = sm.body != null ? String(sm.body) : '';
+    if (!bodyText.trim() && (sm.numMedia ?? 0) > 0) bodyText = '[Media]';
+    if (!bodyText.trim()) bodyText = ' ';
+
+    try {
+      const convSid = await findOrCreateConversationForCustomerAddress(customer);
+      await ensureChatParticipantInConversation(convSid);
+      convTouched.add(convSid);
+
+      if (await conversationAlreadyHasMirroredProgrammableSid(convSid, sm.sid)) {
+        skipped++;
+        continue;
+      }
+
+      const outbound = fromMatchesOurTwilioNumber(sm.from);
+
+      if (outbound) {
+        const skipWebDup = await recentChatAuthorMessageMatchesBody(
+          convSid,
+          bodyText,
+          25_000
+        );
+        if (skipWebDup) {
+          skipped++;
+          continue;
+        }
+        await mirrorProgrammableOutboundToConversation(
+          convSid,
+          bodyText,
+          sm.sid,
+          sm.dateSent
+        );
+      } else {
+        const skipNative = await likelyNativeInboundDuplicate(convSid, bodyText, sm.dateSent);
+        if (skipNative) {
+          skipped++;
+          continue;
+        }
+        const parsed = toE164Australian(customer);
+        const customerE164 = parsed.ok ? parsed.e164 : customer.trim();
+        await mirrorProgrammableInboundToConversation(
+          convSid,
+          bodyText,
+          sm.sid,
+          customerE164,
+          sm.dateSent
+        );
+      }
+      imported++;
+    } catch (e) {
+      console.warn('sync sms log row failed', sm.sid, e?.message);
+      skipped++;
+    }
+  }
+
+  return {
+    imported,
+    skipped,
+    scanned: merged.length,
+    conversationsTouched: convTouched.size,
+  };
+}
+
+/** Avoid duplicating messages the user just sent from the web app (same SMS hits this webhook). */
+async function recentChatAuthorMessageMatchesBody(conversationSid, bodyText, windowMs) {
+  const want = (bodyText || '').trim();
+  if (!want) return false;
+  const page = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(conversationSid)
+    .messages.page({ order: 'desc', pageSize: 25 });
+  const now = Date.now();
+  for (const msg of page.instances) {
+    if (msg.author !== twilioChatIdentity) continue;
+    if ((msg.body || '').trim() !== want) continue;
+    const t = msg.dateCreated?.getTime?.() ?? 0;
+    if (t > 0 && now - t >= 0 && now - t <= windowMs) return true;
+  }
+  return false;
 }
 
 const app = express();
@@ -146,7 +471,7 @@ app.post(
   '/api/webhooks/twilio/conversations',
   express.urlencoded({ extended: false }),
   async (req, res) => {
-    if (!validateTwilioConversationsWebhook(req)) {
+    if (!validateTwilioWebhookSignature(req)) {
       return res.status(403).send('Forbidden');
     }
     const event = req.body.EventType || req.body.eventType;
@@ -162,6 +487,90 @@ app.post(
         return res.status(500).send('Error');
       }
     }
+    res.status(200).end();
+  }
+);
+
+/**
+ * Programmable Messaging (Zapier, Messages API) status callback: mirror outbound SMS into
+ * Twilio Conversations so PBSG Messenger shows the same thread. Uses Author=system plus
+ * JSON attributes so we do not trigger a second SMS to the customer.
+ *
+ * Configure Status Callback URL (phone number, Messaging Service, or per Zapier send) to:
+ *   https://YOUR-API/api/webhooks/twilio/programmable-messaging
+ * TWILIO_AUTH_TOKEN should be set so Twilio can sign requests.
+ */
+app.post(
+  '/api/webhooks/twilio/programmable-messaging',
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    if (!validateTwilioWebhookSignature(req)) {
+      return res.status(403).send('Forbidden');
+    }
+
+    const messageSid = req.body.MessageSid || req.body.SmsSid;
+    const statusRaw = (req.body.MessageStatus || req.body.SmsStatus || '').toLowerCase();
+    const direction = (req.body.Direction || '').toLowerCase();
+
+    if (!messageSid || statusRaw !== 'sent') {
+      return res.status(200).end();
+    }
+    if (direction && !direction.startsWith('outbound')) {
+      return res.status(200).end();
+    }
+
+    const from = req.body.From;
+    const to = req.body.To;
+    if (!from || !to || !fromMatchesOurTwilioNumber(from)) {
+      return res.status(200).end();
+    }
+
+    if (mirroredProgrammableMessageSids.has(messageSid)) {
+      return res.status(200).end();
+    }
+
+    let bodyText = typeof req.body.Body === 'string' ? req.body.Body : '';
+    if (!bodyText && req.body.NumMedia && Number(req.body.NumMedia) > 0) {
+      bodyText = '[Media]';
+    }
+
+    try {
+      if (!bodyText) {
+        const m = await twilioClient.messages(messageSid).fetch();
+        bodyText = (m.body && String(m.body)) || '';
+      }
+    } catch (e) {
+      console.warn('programmable-messaging webhook: could not fetch message body', messageSid, e?.message);
+    }
+
+    try {
+      const convSid = await findOrCreateConversationForCustomerAddress(to);
+      await ensureChatParticipantInConversation(convSid);
+      const skipDuplicateWebSend = await recentChatAuthorMessageMatchesBody(
+        convSid,
+        bodyText,
+        25_000
+      );
+      if (!skipDuplicateWebSend) {
+        let dateCreated;
+        const ds = req.body.DateSent;
+        if (ds) {
+          const t = Date.parse(String(ds));
+          if (!Number.isNaN(t)) dateCreated = new Date(t);
+        }
+        await mirrorProgrammableOutboundToConversation(
+          convSid,
+          bodyText,
+          messageSid,
+          dateCreated
+        );
+      }
+      rememberMirroredSid(messageSid);
+    } catch (e) {
+      console.error('programmable-messaging mirror error:', e);
+      return res.status(500).send('Error');
+    }
+
     res.status(200).end();
   }
 );
@@ -289,6 +698,32 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
  * Add the web inbox identity to every Conversation in this service that lacks it.
  * Use once after deploy or when old SMS-only threads never triggered onConversationAdded.
  */
+/**
+ * POST /api/sync-sms-log
+ * Header: Authorization: Bearer <sessionJwt>
+ * Body (optional): { daysBack?: number } — default 30, max 90.
+ * Reads Twilio Programmable Messaging (the SMS/MMS log in Console) and mirrors each
+ * message into the matching Conversation so the inbox matches what you see under Logs.
+ */
+app.post('/api/sync-sms-log', requireSession, async (req, res) => {
+  const raw = req.body?.daysBack;
+  const daysBack =
+    typeof raw === 'number' && Number.isFinite(raw)
+      ? raw
+      : typeof raw === 'string'
+        ? Number.parseInt(raw, 10)
+        : 30;
+  try {
+    const result = await syncProgrammableSmsLogIntoConversations(
+      Number.isFinite(daysBack) ? daysBack : 30
+    );
+    return res.json(result);
+  } catch (err) {
+    console.error('Sync SMS log error:', err);
+    return res.status(500).json({ error: err?.message || 'SMS log sync failed.' });
+  }
+});
+
 app.post('/api/repair-chat-participants', requireSession, async (_req, res) => {
   let scanned = 0;
   let added = 0;
@@ -326,35 +761,15 @@ app.post('/api/conversations', requireSession, async (req, res) => {
     return res.status(400).json({ error: phone.error });
   }
 
-  const proxy = twilioPhone.trim().startsWith('+')
-    ? twilioPhone.trim()
-    : `+${twilioPhone.replace(/\D/g, '')}`;
-
   try {
-    const conversation = await twilioClient.conversations.v1
+    const sid = await createSmsConversationForCustomerE164(phone.e164);
+    const conv = await twilioClient.conversations.v1
       .services(serviceSid)
-      .conversations.create({
-        friendlyName: `SMS ${phone.e164}`,
-      });
-
-    await twilioClient.conversations.v1
-      .services(serviceSid)
-      .conversations(conversation.sid)
-      .participants.create({
-        identity: twilioChatIdentity,
-      });
-
-    await twilioClient.conversations.v1
-      .services(serviceSid)
-      .conversations(conversation.sid)
-      .participants.create({
-        'messagingBinding.address': phone.e164,
-        'messagingBinding.proxyAddress': proxy,
-      });
-
+      .conversations(sid)
+      .fetch();
     return res.status(201).json({
-      conversationSid: conversation.sid,
-      friendlyName: conversation.friendlyName,
+      conversationSid: sid,
+      friendlyName: conv.friendlyName,
     });
   } catch (err) {
     console.error('Create conversation error:', err);
