@@ -70,10 +70,20 @@ requireEnv();
 
 const twilioClient = twilio(apiKey, apiSecret, { accountSid });
 
+/** Browser Origin never has a trailing slash; strip so CORS matches Netlify exactly. */
+function corsOriginOption() {
+  const raw = process.env.CORS_ORIGIN;
+  if (!raw?.trim()) return true;
+  return raw
+    .split(',')
+    .map((s) => s.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+}
+
 const app = express();
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN?.split(',').map((s) => s.trim()) || true,
+    origin: corsOriginOption(),
     credentials: true,
   })
 );
@@ -160,6 +170,42 @@ app.post('/api/token', requireSession, (_req, res) => {
  * Header: Authorization: Bearer <sessionJwt>
  * Body: { to: string (phone) }
  */
+/**
+ * List every Conversation SID where this service's chat identity is a participant.
+ * Used so the inbox can show full history, not only what the JS SDK synced first.
+ */
+async function listConversationSidsForIdentity() {
+  const sids = [];
+  let page = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .participantConversations.page({
+      identity: twilioChatIdentity,
+      pageSize: 100,
+    });
+  for (;;) {
+    for (const row of page.instances) {
+      if (row.conversationSid) sids.push(row.conversationSid);
+    }
+    if (!page.nextPageUrl) break;
+    page = await page.nextPage();
+  }
+  return [...new Set(sids)];
+}
+
+/**
+ * GET /api/conversation-sids
+ * Header: Authorization: Bearer <sessionJwt>
+ */
+app.get('/api/conversation-sids', requireSession, async (_req, res) => {
+  try {
+    const conversationSids = await listConversationSidsForIdentity();
+    return res.json({ conversationSids });
+  } catch (err) {
+    console.error('List conversations error:', err);
+    return res.status(500).json({ error: 'Failed to list conversations.' });
+  }
+});
+
 app.post('/api/conversations', requireSession, async (req, res) => {
   const phone = toE164Australian(req.body?.to);
   if (!phone.ok) {
