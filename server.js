@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import twilio from 'twilio';
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { toE164Australian } from './lib/phone.js';
 
@@ -101,14 +101,14 @@ function requireSession(req, res, next) {
  * Body: { password: string }
  * Returns a signed session JWT (store in browser; use as Bearer for /api/token and /api/conversations).
  */
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', (req, res) => {
   const password = req.body?.password;
   if (!password || typeof password !== 'string') {
     return res.status(400).json({ error: 'Password is required.' });
   }
 
   try {
-    const ok = await bcrypt.compare(password, appPasswordHash);
+    const ok = bcrypt.compareSync(password, appPasswordHash);
     if (!ok) {
       return res.status(401).json({ error: 'Invalid credentials.' });
     }

@@ -7,7 +7,7 @@
  *
  * Prefer stdin / prompted input on shared machines so the password is not in shell history.
  */
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
@@ -26,6 +26,6 @@ if (!plain) {
   process.exit(1);
 }
 
-const hash = await bcrypt.hash(plain, rounds);
+const hash = bcrypt.hashSync(plain, rounds);
 console.log('\nAdd this to backend .env (quote if your shell treats $ specially):\n');
 console.log(`APP_PASSWORD_HASH=${hash}\n`);
