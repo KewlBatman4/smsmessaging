@@ -69,6 +69,7 @@ function requireEnv() {
 requireEnv();
 
 const twilioClient = twilio(apiKey, apiSecret, { accountSid });
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 
 /** Browser Origin never has a trailing slash; strip so CORS matches Netlify exactly. */
 function corsOriginOption() {
@@ -80,13 +81,86 @@ function corsOriginOption() {
     .filter(Boolean);
 }
 
+/**
+ * Inbound SMS / autocreated Conversations often only have an SMS participant.
+ * Without this chat participant, the web app (same identity as the token) never sees the thread.
+ */
+async function ensureChatParticipantInConversation(conversationSid) {
+  try {
+    await twilioClient.conversations.v1
+      .services(serviceSid)
+      .conversations(conversationSid)
+      .participants.create({ identity: twilioChatIdentity });
+  } catch (err) {
+    const code = err?.code;
+    const msg = String(err?.message || '').toLowerCase();
+    if (
+      code === 409 ||
+      code === 50215 ||
+      msg.includes('already exists') ||
+      msg.includes('duplicate') ||
+      msg.includes('is already')
+    ) {
+      return;
+    }
+    throw err;
+  }
+}
+
+function validateTwilioConversationsWebhook(req) {
+  if (!twilioAuthToken) {
+    console.warn(
+      'TWILIO_AUTH_TOKEN not set; Conversations webhook signature verification is disabled.'
+    );
+    return true;
+  }
+  const sig = req.headers['x-twilio-signature'];
+  if (!sig) return false;
+  const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  return twilio.validateRequest(twilioAuthToken, sig, url, req.body);
+}
+
 const app = express();
+app.set('trust proxy', 1);
 app.use(
   cors({
     origin: corsOriginOption(),
     credentials: true,
   })
 );
+
+/**
+ * Twilio Conversations post-action webhook: add browser identity to new conversations
+ * (e.g. inbound SMS autocreate) so PBSG Messenger can load them.
+ *
+ * Console: your Conversation Service → Webhooks → Post-Event URL:
+ *   https://YOUR-API/api/webhooks/twilio/conversations
+ * Enable event: onConversationAdded (and URL must be reachable publicly).
+ *
+ * Also ensure inbound SMS can reach Conversations (see Twilio "Inbound autocreation"
+ * and avoid a conflicting "A message comes in" handler on the number when possible).
+ */
+app.post(
+  '/api/webhooks/twilio/conversations',
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    if (!validateTwilioConversationsWebhook(req)) {
+      return res.status(403).send('Forbidden');
+    }
+    const event = req.body.EventType || req.body.eventType;
+    const convSid = req.body.ConversationSid || req.body.conversationSid;
+    if (event === 'onConversationAdded' && convSid) {
+      try {
+        await ensureChatParticipantInConversation(convSid);
+      } catch (e) {
+        console.error('Conversations webhook ensureChatParticipant:', e);
+        return res.status(500).send('Error');
+      }
+    }
+    res.status(200).end();
+  }
+);
+
 app.use(express.json({ limit: '100kb' }));
 
 function requireSession(req, res, next) {
