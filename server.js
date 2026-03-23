@@ -472,7 +472,7 @@ async function createSmsConversationForCustomerE164(customerE164) {
   const conversation = await twilioClient.conversations.v1
     .services(serviceSid)
     .conversations.create({
-      friendlyName: `SMS ${customerE164}`,
+      friendlyName: customerE164,
     });
   const sid = conversation.sid;
   await twilioClient.conversations.v1
