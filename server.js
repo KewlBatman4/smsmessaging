@@ -4,6 +4,7 @@ import cors from 'cors';
 import twilio from 'twilio';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import webpush from 'web-push';
 import { toE164Australian } from './lib/phone.js';
 import {
   appendTrelloRelayMessages,
@@ -21,6 +22,9 @@ const apiKey = process.env.TWILIO_API_KEY;
 const apiSecret = process.env.TWILIO_API_SECRET;
 const serviceSid = process.env.TWILIO_CONVERSATIONS_SERVICE_SID;
 const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
+const pushVapidPublicKey = process.env.PUSH_VAPID_PUBLIC_KEY;
+const pushVapidPrivateKey = process.env.PUSH_VAPID_PRIVATE_KEY;
+const pushVapidSubject = process.env.PUSH_VAPID_SUBJECT || 'mailto:admin@example.com';
 
 /** E.164 for the number that receives self-SMS Trello relay payloads (default: your Trello SMS number). */
 function trelloRelayE164() {
@@ -90,6 +94,7 @@ requireEnv();
 
 const twilioClient = twilio(apiKey, apiSecret, { accountSid });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
+const pushSubscriptions = new Map();
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
 function programmableStatusMirrorEnabled() {
@@ -145,6 +150,53 @@ function validateTwilioWebhookSignature(req) {
   if (!sig) return false;
   const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
   return twilio.validateRequest(twilioAuthToken, sig, url, req.body);
+}
+
+function webPushEnabled() {
+  return Boolean(pushVapidPublicKey && pushVapidPrivateKey);
+}
+
+if (webPushEnabled()) {
+  webpush.setVapidDetails(pushVapidSubject, pushVapidPublicKey, pushVapidPrivateKey);
+}
+
+function pushSubscriptionKey(sub) {
+  if (!sub || typeof sub.endpoint !== 'string') return null;
+  return sub.endpoint.trim();
+}
+
+function normalizePushSubscription(input) {
+  if (!input || typeof input !== 'object') return null;
+  const endpoint = typeof input.endpoint === 'string' ? input.endpoint.trim() : '';
+  const p256dh = input?.keys?.p256dh;
+  const auth = input?.keys?.auth;
+  if (!endpoint || !p256dh || !auth) return null;
+  return {
+    endpoint,
+    expirationTime: input.expirationTime ?? null,
+    keys: { p256dh, auth },
+  };
+}
+
+async function sendWebPushToAll(payload) {
+  const deadKeys = [];
+  const sends = [];
+  for (const [key, sub] of pushSubscriptions.entries()) {
+    sends.push(
+      webpush.sendNotification(sub, JSON.stringify(payload)).catch((err) => {
+        const code = Number(err?.statusCode || 0);
+        if (code === 404 || code === 410) {
+          deadKeys.push(key);
+          return;
+        }
+        throw err;
+      })
+    );
+  }
+  await Promise.all(sends);
+  for (const key of deadKeys) {
+    pushSubscriptions.delete(key);
+  }
 }
 
 function extractInternalDraftSegment(bodyText) {
@@ -608,6 +660,68 @@ function requireSession(req, res, next) {
     return res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
   }
 }
+
+/**
+ * GET /api/push/public-key
+ * Returns VAPID public key for browser PushManager.subscribe().
+ */
+app.get('/api/push/public-key', (_req, res) => {
+  if (!webPushEnabled()) {
+    return res.status(503).json({ error: 'Web push is not configured.' });
+  }
+  return res.json({ publicKey: pushVapidPublicKey });
+});
+
+/**
+ * POST /api/push/subscribe
+ * Body: { subscription: PushSubscriptionJSON }
+ */
+app.post('/api/push/subscribe', (req, res) => {
+  if (!webPushEnabled()) {
+    return res.status(503).json({ error: 'Web push is not configured.' });
+  }
+  const sub = normalizePushSubscription(req.body?.subscription);
+  const key = pushSubscriptionKey(sub);
+  if (!sub || !key) {
+    return res.status(400).json({ error: 'Invalid push subscription.' });
+  }
+  pushSubscriptions.set(key, sub);
+  return res.json({ ok: true, subscribed: pushSubscriptions.size });
+});
+
+/**
+ * POST /api/push/unsubscribe
+ * Body: { endpoint: string }
+ */
+app.post('/api/push/unsubscribe', (req, res) => {
+  const endpoint = typeof req.body?.endpoint === 'string' ? req.body.endpoint.trim() : '';
+  if (!endpoint) {
+    return res.status(400).json({ error: 'Missing endpoint.' });
+  }
+  pushSubscriptions.delete(endpoint);
+  return res.json({ ok: true, subscribed: pushSubscriptions.size });
+});
+
+/**
+ * POST /api/push/test
+ * Header: Authorization: Bearer <sessionJwt>
+ * Body: { title?: string, body?: string, url?: string }
+ */
+app.post('/api/push/test', requireSession, async (req, res) => {
+  if (!webPushEnabled()) {
+    return res.status(503).json({ error: 'Web push is not configured.' });
+  }
+  const title = String(req.body?.title || 'PBSG Messenger').trim() || 'PBSG Messenger';
+  const body = String(req.body?.body || 'Test push notification').trim() || 'Test push notification';
+  const url = String(req.body?.url || '/').trim() || '/';
+  try {
+    await sendWebPushToAll({ title, body, url });
+    return res.json({ ok: true, sentTo: pushSubscriptions.size });
+  } catch (err) {
+    console.error('Push test send error:', err);
+    return res.status(500).json({ error: 'Failed to send push notification.' });
+  }
+});
 
 /**
  * POST /api/login
