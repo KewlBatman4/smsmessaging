@@ -199,6 +199,12 @@ async function sendWebPushToAll(payload) {
   }
 }
 
+function pushPreviewText(raw, maxLen = 140) {
+  const s = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  return s.length > maxLen ? `${s.slice(0, maxLen)}...` : s;
+}
+
 function extractInternalDraftSegment(bodyText) {
   const raw = String(bodyText || '');
   const m = raw.match(/\[\[PBSG_INTERNAL_DRAFT\]\]([\s\S]*?)\[\[\/PBSG_INTERNAL_DRAFT\]\]/i);
@@ -488,6 +494,30 @@ app.post(
           const draftBody = extractInternalDraftSegment(bodyText);
           if (draftBody) {
             await ensureInternalDraftMirrorMessage(convSid, messageSid, draftBody);
+          }
+        }
+        // Phone push notification for new inbound customer messages.
+        // Skip system/web-app-authored messages to avoid notifying on our own sends.
+        if (
+          event === 'onMessageAdded' &&
+          author &&
+          author !== 'system' &&
+          author !== twilioChatIdentity &&
+          webPushEnabled() &&
+          pushSubscriptions.size > 0
+        ) {
+          try {
+            const preview = pushPreviewText(bodyText) || 'New message received';
+            await sendWebPushToAll({
+              title: 'New message',
+              body: preview,
+              url: '/',
+              conversationSid: convSid || null,
+              messageSid: messageSid || null,
+            });
+          } catch (pushErr) {
+            // Never fail Twilio webhook for push transport issues.
+            console.warn('Conversations webhook push notify error:', pushErr?.message || pushErr);
           }
         }
       } catch (e) {
