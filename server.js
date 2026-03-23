@@ -147,6 +147,53 @@ function validateTwilioWebhookSignature(req) {
   return twilio.validateRequest(twilioAuthToken, sig, url, req.body);
 }
 
+function extractInternalDraftSegment(bodyText) {
+  const raw = String(bodyText || '');
+  const m = raw.match(/\[\[PBSG_INTERNAL_DRAFT\]\]([\s\S]*?)\[\[\/PBSG_INTERNAL_DRAFT\]\]/i);
+  if (!m) return null;
+  const draftBody = String(m[1] || '').trim();
+  return draftBody || null;
+}
+
+function parseAttributesJson(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  if (typeof raw !== 'string') return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function ensureInternalDraftMirrorMessage(conversationSid, sourceMessageSid, draftBody) {
+  if (!conversationSid || !draftBody) return;
+  const page = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(conversationSid)
+    .messages.page({ order: 'desc', pageSize: 30 });
+  for (const msg of page.instances) {
+    const attrs = parseAttributesJson(msg.attributes);
+    if (attrs?.pbsgInternalDraftSourceMessageSid === sourceMessageSid) {
+      return;
+    }
+  }
+  const attrs = JSON.stringify({
+    pbsgOutbound: true,
+    pbsgInternalDraft: true,
+    pbsgInternalDraftSourceMessageSid: sourceMessageSid || null,
+  });
+  await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations(conversationSid)
+    .messages.create({
+      author: 'system',
+      body: draftBody,
+      attributes: attrs,
+      xTwilioWebhookEnabled: 'false',
+    });
+}
+
 function proxyNumberE164() {
   const t = twilioPhone.trim();
   return t.startsWith('+') ? t : `+${t.replace(/\D/g, '')}`;
@@ -374,12 +421,23 @@ app.post(
     }
     const event = req.body.EventType || req.body.eventType;
     const convSid = req.body.ConversationSid || req.body.conversationSid;
+    const messageSid = req.body.MessageSid || req.body.messageSid;
+    const bodyText = req.body.Body || req.body.body || '';
+    const author = req.body.Author || req.body.author || '';
     const shouldEnsure =
       convSid &&
       (event === 'onConversationAdded' || event === 'onMessageAdded');
     if (shouldEnsure) {
       try {
         await ensureChatParticipantInConversation(convSid);
+        // Display-only helper: if inbound message embeds [[PBSG_INTERNAL_DRAFT]], add a synthetic
+        // pbsgOutbound row so the draft text appears as a right-aligned "sent" bubble in the app.
+        if (event === 'onMessageAdded' && author !== 'system') {
+          const draftBody = extractInternalDraftSegment(bodyText);
+          if (draftBody) {
+            await ensureInternalDraftMirrorMessage(convSid, messageSid, draftBody);
+          }
+        }
       } catch (e) {
         console.error('Conversations webhook ensureChatParticipant:', e);
         return res.status(500).send('Error');
