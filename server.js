@@ -79,13 +79,14 @@ function programmableStatusMirrorEnabled() {
 }
 
 /**
- * Sync inbox (SMS log → Conversations) is opt-in (default off). Inbound rows still called
- * messages.create + findOrCreate (SMS binding); that path has been implicated in extra customer SMS.
+ * SMS log sync → Conversations is ON by default so Sync inbox pulls inbound history into the app.
+ * Set SMS_LOG_SYNC_WRITE_CONVERSATIONS=false only as an emergency stop. Outbound log rows stay a
+ * separate opt-in (SMS_LOG_SYNC_OUTBOUND_MIRROR); status-callback mirror is TWILIO_PROGRAMMABLE_STATUS_MIRROR.
  */
 function syncConversationWritesEnabled() {
-  return ['true', '1', 'yes', 'on'].includes(
-    String(process.env.SMS_LOG_SYNC_WRITE_CONVERSATIONS ?? 'false').toLowerCase()
-  );
+  const v = process.env.SMS_LOG_SYNC_WRITE_CONVERSATIONS;
+  if (v == null || String(v).trim() === '') return true;
+  return !['false', '0', 'no', 'off'].includes(String(v).trim().toLowerCase());
 }
 
 /** Browser Origin never has a trailing slash; strip so CORS matches Netlify exactly. */
@@ -488,7 +489,7 @@ async function syncProgrammableSmsLogIntoConversations(
       outboundMirrorEnabled: false,
       syncConversationWrites: false,
       hint:
-        'SMS log sync did nothing: set SMS_LOG_SYNC_WRITE_CONVERSATIONS=true on the API to import rows (test on a sandbox number first).',
+        'SMS log sync writes are off: SMS_LOG_SYNC_WRITE_CONVERSATIONS=false. Remove that variable or set true to import history again.',
       programmableMirrorAuthor: 'system',
       scanned: 0,
       conversationsTouched: 0,
