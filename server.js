@@ -101,6 +101,10 @@ const twilioClient = twilio(apiKey, apiSecret, { accountSid });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const pushSubscriptions = new Map();
 const nativePushTokens = new Set();
+let nativePushLastAttemptAt = null;
+let nativePushLastSuccessAt = null;
+let nativePushLastError = null;
+let nativePushLastResult = null;
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
 function programmableStatusMirrorEnabled() {
@@ -237,6 +241,7 @@ function normalizeNativePushToken(input) {
 
 async function sendNativePushToAll(payload) {
   if (!firebaseMessaging || !nativePushTokens.size) return;
+  nativePushLastAttemptAt = new Date().toISOString();
   const tokens = [...nativePushTokens];
   const message = {
     tokens,
@@ -255,6 +260,13 @@ async function sendNativePushToAll(payload) {
     },
   };
   const result = await firebaseMessaging.sendEachForMulticast(message);
+  nativePushLastResult = {
+    successCount: result.successCount,
+    failureCount: result.failureCount,
+    tokenCount: tokens.length,
+  };
+  nativePushLastSuccessAt = new Date().toISOString();
+  nativePushLastError = null;
   result.responses.forEach((r, idx) => {
     if (r.success) return;
     const code = r.error?.code || '';
@@ -833,7 +845,39 @@ app.get('/api/push/fcm/status', requireSession, (_req, res) => {
     ok: true,
     configured: Boolean(firebaseMessaging),
     subscribed: nativePushTokens.size,
+    lastAttemptAt: nativePushLastAttemptAt,
+    lastSuccessAt: nativePushLastSuccessAt,
+    lastError: nativePushLastError,
+    lastResult: nativePushLastResult,
   });
+});
+
+/**
+ * POST /api/push/fcm/test
+ * Body: { title?: string, body?: string, url?: string }
+ */
+app.post('/api/push/fcm/test', async (req, res) => {
+  if (!firebaseMessaging) {
+    return res.status(503).json({ error: 'Native push is not configured.' });
+  }
+  if (!nativePushTokens.size) {
+    return res.status(400).json({ error: 'No native push tokens subscribed yet.' });
+  }
+  const title = String(req.body?.title || 'PBSG Messenger').trim() || 'PBSG Messenger';
+  const body = String(req.body?.body || 'Native FCM test').trim() || 'Native FCM test';
+  const url = String(req.body?.url || '/').trim() || '/';
+  try {
+    await sendNativePushToAll({ title, body, url });
+    return res.json({
+      ok: true,
+      subscribed: nativePushTokens.size,
+      lastResult: nativePushLastResult,
+    });
+  } catch (err) {
+    nativePushLastError = err?.message || String(err);
+    console.error('Native push test send error:', err);
+    return res.status(500).json({ error: 'Native FCM test failed.', detail: nativePushLastError });
+  }
 });
 
 /**
@@ -1140,6 +1184,10 @@ app.get('/api/health', (_req, res) => {
     programmableStatusCallbackMirror: programmableStatusMirrorEnabled(),
     nativePushConfigured: Boolean(firebaseMessaging),
     nativePushSubscriptions: nativePushTokens.size,
+    nativePushLastAttemptAt,
+    nativePushLastSuccessAt,
+    nativePushLastError,
+    nativePushLastResult,
   });
 });
 
