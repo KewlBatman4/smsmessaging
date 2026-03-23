@@ -345,19 +345,18 @@ async function mirrorProgrammableOutboundToConversation(
     pbsgOutbound: true,
     programmaticMessageSid: messageSid,
   });
-  // Must stay author "system": chat identity messages in SMS-bound threads are delivered as real SMS
-  // to the customer. The web app treats attributes.pbsgOutbound as "our" bubble (right side).
-  const params = {
-    author: 'system',
+  // Do not use the browser chat identity here: Twilio relays chat-participant messages as SMS.
+  // Omit Author so Twilio defaults to system; the web app uses attributes.pbsgOutbound for the right bubble.
+  const createParams = {
     body: bodyText,
     attributes: attrs,
+    xTwilioWebhookEnabled: 'false',
   };
-  if (dateCreated) params.dateCreated = dateCreated;
-  params.xTwilioWebhookEnabled = 'false';
+  if (dateCreated) createParams.dateCreated = dateCreated;
   await twilioClient.conversations.v1
     .services(serviceSid)
     .conversations(conversationSid)
-    .messages.create(params);
+    .messages.create(createParams);
 }
 
 async function mirrorProgrammableInboundToConversation(
@@ -456,13 +455,13 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
   const our = proxyNumberE164();
   const dateSentAfter = new Date(Date.now() - Math.min(Math.max(daysBack, 1), 90) * 86400000);
   /**
-   * Outbound log rows (Zapier, etc.): off by default. Prefer the programmable-messaging webhook.
-   * If enabled, mirrored rows use author "system" only — do not switch to chat identity or Twilio
-   * will send duplicate SMS for each mirrored line.
+   * Outbound log rows (Zapier, API, etc.): ON by default so sync shows your sends in the app.
+   * Mirrored rows use author "system" + attributes.pbsgOutbound — not the chat identity — so Twilio
+   * does not relay them as new SMS (see mirrorProgrammableOutboundToConversation).
+   * Set SMS_LOG_SYNC_OUTBOUND_MIRROR=false to skip outbound rows (e.g. debugging).
    */
-  const allowOutboundMirror = ['true', '1', 'yes'].includes(
-    String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR || '').toLowerCase()
-  );
+  const outboundMirrorEnv = String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR ?? 'true').toLowerCase();
+  const allowOutboundMirror = !['false', '0', 'no', 'off'].includes(outboundMirrorEnv);
 
   const ourSenders = collectOurOutboundSenderE164List();
   const toUs = await pageAllProgrammableMessages({ to: our, dateSentAfter });
@@ -563,6 +562,8 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
     skipped,
     skippedOutboundPolicy,
     outboundMirrorEnabled: allowOutboundMirror,
+    /** Helps verify deploy: mirrors must use "system" or customers get duplicate SMS. */
+    programmableMirrorAuthor: 'system',
     scanned: merged.length,
     conversationsTouched: convTouched.size,
   };
