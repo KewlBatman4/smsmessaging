@@ -260,6 +260,7 @@ async function sendNativePushToAll(payload) {
       priority: 'high',
       notification: {
         channelId: 'high_importance_channel',
+        icon: 'ic_stat_pbsg',
         priority: 'high',
         defaultSound: true,
         visibility: 'public',
