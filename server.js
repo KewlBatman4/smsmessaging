@@ -625,7 +625,32 @@ async function listConversationSidsForIdentity() {
     if (!page.nextPageUrl) break;
     page = await page.nextPage();
   }
-  return [...new Set(sids)];
+  const unique = [...new Set(sids)];
+  if (unique.length) return unique;
+
+  /**
+   * Fallback for service-created threads that exist but missed the post-event webhook:
+   * attach the web inbox identity and return those SIDs so the UI can open them now.
+   */
+  const recovered = [];
+  let convPage = await twilioClient.conversations.v1
+    .services(serviceSid)
+    .conversations.page({ pageSize: 50 });
+  for (;;) {
+    for (const conv of convPage.instances) {
+      const sid = conv.sid;
+      if (!sid) continue;
+      try {
+        await ensureChatParticipantInConversation(sid);
+        recovered.push(sid);
+      } catch (e) {
+        console.warn('listConversationSidsForIdentity fallback', sid, e?.message);
+      }
+    }
+    if (!convPage.nextPageUrl) break;
+    convPage = await convPage.nextPage();
+  }
+  return [...new Set(recovered)];
 }
 
 /**
