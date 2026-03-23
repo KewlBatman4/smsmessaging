@@ -1303,7 +1303,9 @@ app.post('/api/push/studio-inbound', async (req, res) => {
       }
     }
     const conversationSid = String(req.body?.conversationSid || req.body?.ConversationSid || '');
-    const messageSid = String(req.body?.messageSid || req.body?.MessageSid || '');
+    const messageSid = String(
+      req.body?.messageSid || req.body?.MessageSid || req.body?.SmsSid || req.body?.smsSid || ''
+    );
     const author = String(req.body?.author || req.body?.Author || '');
     const bodyText = String(req.body?.body || req.body?.Body || '');
     if (!shouldSendPushForMessageSid(messageSid)) {
@@ -1330,16 +1332,39 @@ app.post('/api/push/studio-inbound', async (req, res) => {
       conversationSid: conversationSid || null,
       messageSid: messageSid || null,
     };
+    let webPushSent = false;
+    let nativePushSent = false;
+    let webPushError = null;
+    let nativePushError = null;
     if (webPushEnabled() && pushSubscriptions.size > 0) {
-      await sendWebPushToAll(notifyPayload);
+      try {
+        await sendWebPushToAll(notifyPayload);
+        webPushSent = true;
+      } catch (e) {
+        webPushError = e?.message || String(e);
+        console.warn('Studio inbound web push error:', webPushError);
+      }
     }
     if (firebaseMessaging && nativePushTokens.size > 0) {
-      await sendNativePushToAll(notifyPayload);
+      try {
+        await sendNativePushToAll(notifyPayload);
+        nativePushSent = true;
+      } catch (e) {
+        nativePushError = e?.message || String(e);
+        console.warn('Studio inbound native push error:', nativePushError);
+      }
     }
-    return res.json({ ok: true, sent: true });
+    return res.json({
+      ok: true,
+      sent: webPushSent || nativePushSent,
+      webPushSent,
+      nativePushSent,
+      webPushError,
+      nativePushError,
+    });
   } catch (err) {
     console.error('Studio inbound push error:', err);
-    return res.status(500).json({ error: 'Failed to send studio inbound push.' });
+    return res.status(500).json({ error: 'Failed to send studio inbound push.', detail: err?.message || String(err) });
   }
 });
 
