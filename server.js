@@ -71,6 +71,13 @@ requireEnv();
 const twilioClient = twilio(apiKey, apiSecret, { accountSid });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 
+/** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
+function programmableStatusMirrorEnabled() {
+  return ['true', '1', 'yes', 'on'].includes(
+    String(process.env.TWILIO_PROGRAMMABLE_STATUS_MIRROR ?? 'false').toLowerCase()
+  );
+}
+
 /** Browser Origin never has a trailing slash; strip so CORS matches Netlify exactly. */
 function corsOriginOption() {
   const raw = process.env.CORS_ORIGIN;
@@ -345,9 +352,10 @@ async function mirrorProgrammableOutboundToConversation(
     pbsgOutbound: true,
     programmaticMessageSid: messageSid,
   });
-  // Do not use the browser chat identity here: Twilio relays chat-participant messages as SMS.
-  // Omit Author so Twilio defaults to system; the web app uses attributes.pbsgOutbound for the right bubble.
+  // Never use TWILIO_CONVERSATIONS_IDENTITY here — Twilio relays chat-participant messages as SMS.
+  // Set Author explicitly to "system" (same as inbound mirrors); the web app uses attributes.pbsgOutbound.
   const createParams = {
+    author: 'system',
     body: bodyText,
     attributes: attrs,
     xTwilioWebhookEnabled: 'false',
@@ -756,6 +764,9 @@ app.post(
  * Configure Status Callback URL (phone number, Messaging Service, or per Zapier send) to:
  *   https://YOUR-API/api/webhooks/twilio/programmable-messaging
  * TWILIO_AUTH_TOKEN should be set so Twilio can sign requests.
+ *
+ * Mirroring into Conversations is OFF by default. Set TWILIO_PROGRAMMABLE_STATUS_MIRROR=true only after
+ * you confirm mirrored rows do not relay as new SMS (test on a sandbox number first).
  */
 app.post(
   '/api/webhooks/twilio/programmable-messaging',
@@ -763,6 +774,10 @@ app.post(
   async (req, res) => {
     if (!validateTwilioWebhookSignature(req)) {
       return res.status(403).send('Forbidden');
+    }
+
+    if (!programmableStatusMirrorEnabled()) {
+      return res.status(200).end();
     }
 
     const messageSid = req.body.MessageSid || req.body.SmsSid;
