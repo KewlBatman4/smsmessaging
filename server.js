@@ -105,6 +105,7 @@ let nativePushLastAttemptAt = null;
 let nativePushLastSuccessAt = null;
 let nativePushLastError = null;
 let nativePushLastResult = null;
+let nativePushLastFailures = [];
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
 function programmableStatusMirrorEnabled() {
@@ -265,11 +266,17 @@ async function sendNativePushToAll(payload) {
     failureCount: result.failureCount,
     tokenCount: tokens.length,
   };
+  nativePushLastFailures = [];
   nativePushLastSuccessAt = new Date().toISOString();
   nativePushLastError = null;
   result.responses.forEach((r, idx) => {
     if (r.success) return;
     const code = r.error?.code || '';
+    nativePushLastFailures.push({
+      tokenSuffix: tokens[idx]?.slice(-12) || '',
+      code: code || null,
+      message: r.error?.message || null,
+    });
     if (
       code.includes('registration-token-not-registered') ||
       code.includes('invalid-registration-token')
@@ -849,6 +856,7 @@ app.get('/api/push/fcm/status', requireSession, (_req, res) => {
     lastSuccessAt: nativePushLastSuccessAt,
     lastError: nativePushLastError,
     lastResult: nativePushLastResult,
+    lastFailures: nativePushLastFailures,
   });
 });
 
@@ -872,6 +880,7 @@ app.post('/api/push/fcm/test', async (req, res) => {
       ok: true,
       subscribed: nativePushTokens.size,
       lastResult: nativePushLastResult,
+      lastFailures: nativePushLastFailures,
     });
   } catch (err) {
     nativePushLastError = err?.message || String(err);
@@ -1188,6 +1197,7 @@ app.get('/api/health', (_req, res) => {
     nativePushLastSuccessAt,
     nativePushLastError,
     nativePushLastResult,
+    nativePushLastFailures,
   });
 });
 
