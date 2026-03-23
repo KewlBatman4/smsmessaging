@@ -109,6 +109,8 @@ let nativePushLastFailures = [];
 let lastConversationsWebhook = null;
 const recentConversationsWebhooks = [];
 const seenConversationSids = new Set();
+const newConversationNotifiedAt = new Map();
+const NEW_CONVERSATION_COOLDOWN_MS = 45 * 1000;
 
 function recordConversationsWebhookSnapshot(snapshot) {
   recentConversationsWebhooks.unshift({
@@ -123,6 +125,15 @@ function recordConversationsWebhookSnapshot(snapshot) {
   if (recentConversationsWebhooks.length > 12) {
     recentConversationsWebhooks.length = 12;
   }
+}
+
+function shouldNotifyNewConversation(conversationSid) {
+  if (!conversationSid) return false;
+  const now = Date.now();
+  const lastAt = newConversationNotifiedAt.get(conversationSid) || 0;
+  if (now - lastAt < NEW_CONVERSATION_COOLDOWN_MS) return false;
+  newConversationNotifiedAt.set(conversationSid, now);
+  return true;
 }
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
@@ -645,15 +656,18 @@ app.post(
       const isConversationAddedEvent = event === 'onConversationAdded';
       const isFirstSeenConversationMessage =
         event === 'onMessageAdded' && convSid && !seenConversationSids.has(convSid);
+      const shouldSendNewConversationPush =
+        convSid &&
+        shouldNotifyNewConversation(convSid) &&
+        (isConversationAddedEvent || isFirstSeenConversationMessage);
       if (convSid) {
         seenConversationSids.add(convSid);
       }
-      if (
-        hasPushTargets &&
-        (isInboundMessageEvent || isConversationAddedEvent || isFirstSeenConversationMessage)
-      ) {
+      const shouldSendInboundMessagePush =
+        isInboundMessageEvent && !shouldSendNewConversationPush;
+      if (hasPushTargets && (shouldSendNewConversationPush || shouldSendInboundMessagePush)) {
         try {
-          const preview = isConversationAddedEvent || isFirstSeenConversationMessage
+          const preview = shouldSendNewConversationPush
             ? 'New conversation started'
             : pushPreviewText(bodyText) || 'New message received';
           const notifyPayload = {
