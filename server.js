@@ -409,6 +409,20 @@ function rememberMirroredSid(sid) {
   }
 }
 
+/** Dedupe push sends per message SID (avoids double notify across webhook paths). */
+const pushedMessageSids = new Set();
+const PUSH_SID_CAP = 8000;
+function shouldSendPushForMessageSid(sid) {
+  const key = String(sid || '').trim();
+  if (!key) return true;
+  if (pushedMessageSids.has(key)) return false;
+  pushedMessageSids.add(key);
+  if (pushedMessageSids.size > PUSH_SID_CAP) {
+    pushedMessageSids.clear();
+  }
+  return true;
+}
+
 async function listParticipantConversationRowsForAddress(address) {
   const rows = [];
   let page = await twilioClient.conversations.v1
@@ -660,12 +674,17 @@ app.post(
         convSid &&
         shouldNotifyNewConversation(convSid) &&
         (isConversationAddedEvent || isFirstSeenConversationMessage);
+      const shouldSendByMessageSid = shouldSendPushForMessageSid(messageSid);
       if (convSid) {
         seenConversationSids.add(convSid);
       }
       const shouldSendInboundMessagePush =
         isInboundMessageEvent && !shouldSendNewConversationPush;
-      if (hasPushTargets && (shouldSendNewConversationPush || shouldSendInboundMessagePush)) {
+      if (
+        hasPushTargets &&
+        shouldSendByMessageSid &&
+        (shouldSendNewConversationPush || shouldSendInboundMessagePush)
+      ) {
         try {
           const preview = shouldSendNewConversationPush
             ? 'New conversation started'
@@ -1262,6 +1281,65 @@ app.post('/api/conversations', requireSession, async (req, res) => {
     const msg =
       err?.message || 'Failed to create conversation. Check Twilio configuration.';
     return res.status(500).json({ error: msg });
+  }
+});
+
+/**
+ * Studio-triggered inbound push fallback.
+ * Use this from Twilio Studio on inbound message path to guarantee first-message alerts
+ * even when Conversations post-event webhooks are delayed/missing for conversation creation.
+ *
+ * Optional header auth:
+ *  - Set STUDIO_PUSH_WEBHOOK_SECRET in backend env
+ *  - Send matching header x-pbsg-studio-secret from Studio HTTP Request widget
+ */
+app.post('/api/push/studio-inbound', async (req, res) => {
+  try {
+    const expectedSecret = String(process.env.STUDIO_PUSH_WEBHOOK_SECRET || '').trim();
+    if (expectedSecret) {
+      const gotSecret = String(req.headers['x-pbsg-studio-secret'] || '').trim();
+      if (!gotSecret || gotSecret !== expectedSecret) {
+        return res.status(403).json({ error: 'Forbidden.' });
+      }
+    }
+    const conversationSid = String(req.body?.conversationSid || req.body?.ConversationSid || '');
+    const messageSid = String(req.body?.messageSid || req.body?.MessageSid || '');
+    const author = String(req.body?.author || req.body?.Author || '');
+    const bodyText = String(req.body?.body || req.body?.Body || '');
+    if (!shouldSendPushForMessageSid(messageSid)) {
+      return res.json({ ok: true, deduped: true });
+    }
+    if (
+      author &&
+      (author === 'system' || author === twilioChatIdentity) &&
+      !String(req.body?.force || '').trim()
+    ) {
+      return res.json({ ok: true, skipped: 'self_or_system_author' });
+    }
+    const hasPushTargets =
+      (webPushEnabled() && pushSubscriptions.size > 0) ||
+      (firebaseMessaging && nativePushTokens.size > 0);
+    if (!hasPushTargets) {
+      return res.json({ ok: true, skipped: 'no_subscribers' });
+    }
+    const preview = pushPreviewText(bodyText) || 'New conversation started';
+    const notifyPayload = {
+      title: 'New message',
+      body: preview,
+      url: '/',
+      conversationSid: conversationSid || null,
+      messageSid: messageSid || null,
+    };
+    if (webPushEnabled() && pushSubscriptions.size > 0) {
+      await sendWebPushToAll(notifyPayload);
+    }
+    if (firebaseMessaging && nativePushTokens.size > 0) {
+      await sendNativePushToAll(notifyPayload);
+    }
+    return res.json({ ok: true, sent: true });
+  } catch (err) {
+    console.error('Studio inbound push error:', err);
+    return res.status(500).json({ error: 'Failed to send studio inbound push.' });
   }
 });
 
