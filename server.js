@@ -1056,9 +1056,8 @@ app.post('/api/sync-sms-log', requireSession, async (req, res) => {
   }
   smsLogSyncCancelRequested = false;
   try {
-    const shouldCancel = () =>
-      smsLogSyncCancelRequested ||
-      Boolean(req.destroyed || req.aborted || req.socket?.destroyed);
+    /** Only the explicit cancel endpoint — req.aborted/socket flags are flaky behind proxies and caused instant "cancelled" syncs. */
+    const shouldCancel = () => smsLogSyncCancelRequested;
     const result = await syncProgrammableSmsLogIntoConversations(
       Number.isFinite(daysBack) ? daysBack : 30,
       shouldCancel,
