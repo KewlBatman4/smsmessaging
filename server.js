@@ -78,6 +78,16 @@ function programmableStatusMirrorEnabled() {
   );
 }
 
+/**
+ * Sync inbox (SMS log → Conversations) is opt-in (default off). Inbound rows still called
+ * messages.create + findOrCreate (SMS binding); that path has been implicated in extra customer SMS.
+ */
+function syncConversationWritesEnabled() {
+  return ['true', '1', 'yes', 'on'].includes(
+    String(process.env.SMS_LOG_SYNC_WRITE_CONVERSATIONS ?? 'false').toLowerCase()
+  );
+}
+
 /** Browser Origin never has a trailing slash; strip so CORS matches Netlify exactly. */
 function corsOriginOption() {
   const raw = process.env.CORS_ORIGIN;
@@ -470,6 +480,22 @@ async function syncProgrammableSmsLogIntoConversations(
   shouldCancel = () => false,
   { maxMessages } = {}
 ) {
+  if (!syncConversationWritesEnabled()) {
+    return {
+      imported: 0,
+      skipped: 0,
+      skippedOutboundPolicy: 0,
+      outboundMirrorEnabled: false,
+      syncConversationWrites: false,
+      hint:
+        'SMS log sync did nothing: set SMS_LOG_SYNC_WRITE_CONVERSATIONS=true on the API to import rows (test on a sandbox number first).',
+      programmableMirrorAuthor: 'system',
+      scanned: 0,
+      conversationsTouched: 0,
+      cancelled: false,
+    };
+  }
+
   const our = proxyNumberE164();
   const dateSentAfter = new Date(Date.now() - Math.min(Math.max(daysBack, 1), 90) * 86400000);
   /**
@@ -680,6 +706,7 @@ async function syncProgrammableSmsLogIntoConversations(
     skipped,
     skippedOutboundPolicy,
     outboundMirrorEnabled: allowOutboundMirror,
+    syncConversationWrites: true,
     /** Helps verify deploy: mirrors must use "system" or customers get duplicate SMS. */
     programmableMirrorAuthor: 'system',
     scanned: merged.length,
@@ -1144,7 +1171,12 @@ app.post('/api/conversations', requireSession, async (req, res) => {
 });
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'pbsg-messenger-backend' });
+  res.json({
+    ok: true,
+    service: 'pbsg-messenger-backend',
+    smsLogSyncWrites: syncConversationWritesEnabled(),
+    programmableStatusCallbackMirror: programmableStatusMirrorEnabled(),
+  });
 });
 
 app.use((err, _req, res, _next) => {
