@@ -605,16 +605,20 @@ app.post(
         }
         // Phone push notification for new inbound customer messages.
         // Skip system/web-app-authored messages to avoid notifying on our own sends.
-        if (
+        const hasPushTargets =
+          (webPushEnabled() && pushSubscriptions.size > 0) ||
+          (firebaseMessaging && nativePushTokens.size > 0);
+        const isInboundMessageEvent =
           event === 'onMessageAdded' &&
           author &&
           author !== 'system' &&
-          author !== twilioChatIdentity &&
-          ((webPushEnabled() && pushSubscriptions.size > 0) ||
-            (firebaseMessaging && nativePushTokens.size > 0))
-        ) {
+          author !== twilioChatIdentity;
+        const isConversationAddedEvent = event === 'onConversationAdded';
+        if (hasPushTargets && (isInboundMessageEvent || isConversationAddedEvent)) {
           try {
-            const preview = pushPreviewText(bodyText) || 'New message received';
+            const preview = isConversationAddedEvent
+              ? 'New conversation started'
+              : pushPreviewText(bodyText) || 'New message received';
             const notifyPayload = {
               title: 'New message',
               body: preview,
