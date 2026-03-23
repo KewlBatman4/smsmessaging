@@ -610,7 +610,6 @@ app.post(
           (firebaseMessaging && nativePushTokens.size > 0);
         const isInboundMessageEvent =
           event === 'onMessageAdded' &&
-          author &&
           author !== 'system' &&
           author !== twilioChatIdentity;
         const isConversationAddedEvent = event === 'onConversationAdded';
