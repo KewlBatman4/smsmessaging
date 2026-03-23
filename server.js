@@ -5,6 +5,12 @@ import twilio from 'twilio';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { toE164Australian } from './lib/phone.js';
+import {
+  appendTrelloRelayMessages,
+  getTrelloRelayThread,
+  listTrelloRelayThreads,
+  parseTrelloRelaySmsBody,
+} from './lib/trelloRelay.js';
 
 const { AccessToken } = twilio.jwt;
 const { ChatGrant } = AccessToken;
@@ -15,6 +21,13 @@ const apiKey = process.env.TWILIO_API_KEY;
 const apiSecret = process.env.TWILIO_API_SECRET;
 const serviceSid = process.env.TWILIO_CONVERSATIONS_SERVICE_SID;
 const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
+
+/** E.164 for the number that receives self-SMS Trello relay payloads (default: your Trello SMS number). */
+function trelloRelayE164() {
+  const raw = (process.env.TRELLO_RELAY_E164 || '+61468167025').trim();
+  const p = toE164Australian(raw.startsWith('+') ? raw : `+${raw.replace(/\D/g, '')}`);
+  return p.ok ? p.e164 : '+61468167025';
+}
 
 const sessionJwtSecret = process.env.SESSION_JWT_SECRET;
 const appPasswordHash = process.env.APP_PASSWORD_HASH;
@@ -471,6 +484,45 @@ app.post(
   }
 );
 
+/**
+ * Inbound SMS webhook: self-SMS to TRELLO_RELAY_E164 with &&FROM…&& / && REPLY && body.
+ * Stores display-only messages in memory for GET /api/trello-relay/* — does not call Conversations API.
+ *
+ * Twilio Console → Phone number → A message comes in → Webhook URL:
+ *   https://YOUR-API/api/webhooks/twilio/trello-relay  (HTTP POST)
+ * Prefer this path instead of duplicating into Conversations if you only need the web inbox preview.
+ */
+app.post(
+  '/api/webhooks/twilio/trello-relay',
+  express.urlencoded({ extended: false }),
+  (req, res) => {
+    if (!validateTwilioWebhookSignature(req)) {
+      return res.status(403).send('Forbidden');
+    }
+    const relay = trelloRelayE164();
+    const from = req.body.From || req.body.from;
+    const to = req.body.To || req.body.to;
+    if (
+      !from ||
+      !to ||
+      canonicalCustomerE164(from) !== relay ||
+      canonicalCustomerE164(to) !== relay
+    ) {
+      return res.status(200).type('text/xml').send('<Response></Response>');
+    }
+    const bodyText = typeof req.body.Body === 'string' ? req.body.Body : '';
+    const parsed = parseTrelloRelaySmsBody(bodyText);
+    if (parsed) {
+      appendTrelloRelayMessages(
+        parsed.customerE164,
+        parsed.fromBody,
+        parsed.replyBody
+      );
+    }
+    return res.status(200).type('text/xml').send('<Response></Response>');
+  }
+);
+
 app.use(express.json({ limit: '100kb' }));
 
 function requireSession(req, res, next) {
@@ -554,58 +606,6 @@ app.post('/api/token', requireSession, (_req, res) => {
  * Header: Authorization: Bearer <sessionJwt>
  * Body: { to: string (phone) }
  */
-/** Customer E.164 values to omit from GET /api/conversation-sids (comma-separated in HIDDEN_SMS_CUSTOMER_E164). */
-function hiddenCustomerE164Set() {
-  const set = new Set();
-  for (const part of String(process.env.HIDDEN_SMS_CUSTOMER_E164 || '').split(',')) {
-    const c = canonicalCustomerE164(part.trim());
-    if (c) set.add(c);
-  }
-  return set;
-}
-
-/**
- * Best-effort customer number for filtering (friendlyName "SMS +61…" or SMS participant binding).
- */
-async function resolveConversationCustomerE164(conversationSid) {
-  try {
-    const conv = await twilioClient.conversations.v1
-      .services(serviceSid)
-      .conversations(conversationSid)
-      .fetch();
-    const fn = (conv.friendlyName || '').trim();
-    const m = fn.match(/^SMS\s+(.+)$/i);
-    if (m) {
-      const c = canonicalCustomerE164(m[1].trim());
-      if (c) return c;
-    } else if (/^SMS/i.test(fn)) {
-      const rest = fn.replace(/^SMS\s*/i, '').trim();
-      const c = canonicalCustomerE164(rest);
-      if (c) return c;
-    }
-    const parts = await twilioClient.conversations.v1
-      .services(serviceSid)
-      .conversations(conversationSid)
-      .participants.list();
-    for (const p of parts) {
-      const mb = p.messagingBinding;
-      const addr =
-        mb &&
-        (mb.address ||
-          mb.Address ||
-          mb.participant_address ||
-          mb.participantAddress);
-      if (addr) {
-        const c = canonicalCustomerE164(addr);
-        if (c) return c;
-      }
-    }
-  } catch (e) {
-    console.warn('resolveConversationCustomerE164', conversationSid, e?.message);
-  }
-  return null;
-}
-
 /**
  * List every Conversation SID where this service's chat identity is a participant.
  * Used so the REST client can open the same threads the Conversations SDK subscribes to.
@@ -625,16 +625,7 @@ async function listConversationSidsForIdentity() {
     if (!page.nextPageUrl) break;
     page = await page.nextPage();
   }
-  const unique = [...new Set(sids)];
-  const hidden = hiddenCustomerE164Set();
-  if (!hidden.size) return unique;
-  const out = [];
-  for (const sid of unique) {
-    const cust = await resolveConversationCustomerE164(sid);
-    if (cust && hidden.has(cust)) continue;
-    out.push(sid);
-  }
-  return out;
+  return [...new Set(sids)];
 }
 
 /**
@@ -644,12 +635,43 @@ async function listConversationSidsForIdentity() {
 app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   try {
     const conversationSids = await listConversationSidsForIdentity();
-    /** Also returned so the web client can drop the same threads from Twilio SDK’s subscribed list. */
-    const hiddenCustomerE164 = [...hiddenCustomerE164Set()];
-    return res.json({ conversationSids, hiddenCustomerE164 });
+    return res.json({ conversationSids });
   } catch (err) {
     console.error('List conversations error:', err);
     return res.status(500).json({ error: 'Failed to list conversations.' });
+  }
+});
+
+/**
+ * GET /api/trello-relay/threads
+ * In-memory threads parsed from Trello self-SMS relay (display-only; not in Twilio Conversations).
+ */
+app.get('/api/trello-relay/threads', requireSession, (_req, res) => {
+  try {
+    return res.json({ threads: listTrelloRelayThreads() });
+  } catch (err) {
+    console.error('Trello relay list error:', err);
+    return res.status(500).json({ error: 'Failed to list relay threads.' });
+  }
+});
+
+/**
+ * GET /api/trello-relay/thread?customer=%2B614...
+ */
+app.get('/api/trello-relay/thread', requireSession, (req, res) => {
+  const raw = req.query.customer;
+  if (!raw || typeof raw !== 'string') {
+    return res.status(400).json({ error: 'Missing customer (E.164).' });
+  }
+  const c = canonicalCustomerE164(decodeURIComponent(raw.trim()));
+  if (!c) {
+    return res.status(400).json({ error: 'Invalid customer phone.' });
+  }
+  try {
+    return res.json(getTrelloRelayThread(c));
+  } catch (err) {
+    console.error('Trello relay thread error:', err);
+    return res.status(500).json({ error: 'Failed to load relay thread.' });
   }
 });
 
