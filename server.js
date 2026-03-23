@@ -107,6 +107,22 @@ let nativePushLastError = null;
 let nativePushLastResult = null;
 let nativePushLastFailures = [];
 let lastConversationsWebhook = null;
+const recentConversationsWebhooks = [];
+
+function recordConversationsWebhookSnapshot(snapshot) {
+  recentConversationsWebhooks.unshift({
+    at: new Date().toISOString(),
+    event: snapshot?.event || null,
+    conversationSid: snapshot?.conversationSid || null,
+    messageSid: snapshot?.messageSid || null,
+    author: snapshot?.author || null,
+    status: snapshot?.status || null,
+    error: snapshot?.error || null,
+  });
+  if (recentConversationsWebhooks.length > 12) {
+    recentConversationsWebhooks.length = 12;
+  }
+}
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
 function programmableStatusMirrorEnabled() {
@@ -657,6 +673,7 @@ app.post(
     } else if (lastConversationsWebhook.status === 'received') {
       lastConversationsWebhook.status = 'processed_no_push';
     }
+    recordConversationsWebhookSnapshot(lastConversationsWebhook);
     res.status(200).end();
   }
 );
@@ -1238,6 +1255,7 @@ app.get('/api/health', (_req, res) => {
     nativePushLastResult,
     nativePushLastFailures,
     lastConversationsWebhook,
+    recentConversationsWebhooks,
   });
 });
 
