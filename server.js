@@ -345,9 +345,10 @@ async function mirrorProgrammableOutboundToConversation(
     pbsgOutbound: true,
     programmaticMessageSid: messageSid,
   });
-  // Same author as the web app so the UI aligns outbound bubbles to the right (not "system" / left).
+  // Must stay author "system": chat identity messages in SMS-bound threads are delivered as real SMS
+  // to the customer. The web app treats attributes.pbsgOutbound as "our" bubble (right side).
   const params = {
-    author: twilioChatIdentity,
+    author: 'system',
     body: bodyText,
     attributes: attrs,
   };
@@ -454,7 +455,11 @@ async function pageAllProgrammableMessages(listParams) {
 async function syncProgrammableSmsLogIntoConversations(daysBack) {
   const our = proxyNumberE164();
   const dateSentAfter = new Date(Date.now() - Math.min(Math.max(daysBack, 1), 90) * 86400000);
-  /** Bulk sync of *outbound* log rows can cause Twilio to deliver those rows again on the SMS leg — off by default. */
+  /**
+   * Outbound log rows (Zapier, etc.): off by default. Prefer the programmable-messaging webhook.
+   * If enabled, mirrored rows use author "system" only — do not switch to chat identity or Twilio
+   * will send duplicate SMS for each mirrored line.
+   */
   const allowOutboundMirror = ['true', '1', 'yes'].includes(
     String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR || '').toLowerCase()
   );
@@ -629,9 +634,9 @@ app.post(
 
 /**
  * Programmable Messaging (Zapier, Messages API) status callback: mirror outbound SMS into
- * Twilio Conversations so PBSG Messenger shows the same thread. Uses the same chat identity
- * as the web app plus JSON attributes and xTwilioWebhookEnabled=false so we do not trigger
- * a second SMS to the customer.
+ * Twilio Conversations so PBSG Messenger shows the same thread. Author must be "system"
+ * (not the browser chat identity) or Twilio will relay each message as another SMS to the
+ * customer. JSON attributes.pbsgOutbound drives right-aligned bubbles in the web app.
  *
  * Fetches the Message resource so direction and pool "From" numbers are correct (Zapier /
  * Messaging Service senders need not match TWILIO_PHONE_NUMBER).
