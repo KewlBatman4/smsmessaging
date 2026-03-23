@@ -433,15 +433,21 @@ async function likelyNativeInboundDuplicate(conversationSid, bodyText, smDate) {
 
 const SMS_LOG_MAX_PAGES_PER_DIRECTION = 60;
 
-async function pageAllProgrammableMessages(listParams) {
+/** Set true by POST /api/sync-sms-log/cancel; cleared when a sync run finishes. */
+let smsLogSyncCancelRequested = false;
+
+async function pageAllProgrammableMessages(listParams, shouldCancel = () => false) {
   const out = [];
+  if (shouldCancel()) return out;
   let page = await twilioClient.messages.page({
     ...listParams,
     pageSize: 100,
   });
   for (let i = 0; i < SMS_LOG_MAX_PAGES_PER_DIRECTION; i++) {
+    if (shouldCancel()) return out;
     out.push(...page.instances);
     if (!page.nextPageUrl) break;
+    if (shouldCancel()) return out;
     page = await page.nextPage();
   }
   return out;
@@ -451,25 +457,65 @@ async function pageAllProgrammableMessages(listParams) {
  * Pull Twilio Programmable Messaging (SMS log) and append missing rows into Conversations
  * so the web app can show traffic that never entered the Conversation service.
  */
-async function syncProgrammableSmsLogIntoConversations(daysBack) {
+async function syncProgrammableSmsLogIntoConversations(
+  daysBack,
+  shouldCancel = () => false,
+  { maxMessages } = {}
+) {
   const our = proxyNumberE164();
   const dateSentAfter = new Date(Date.now() - Math.min(Math.max(daysBack, 1), 90) * 86400000);
   /**
-   * Outbound log rows (Zapier, API, etc.): ON by default so sync shows your sends in the app.
-   * Mirrored rows use author "system" + attributes.pbsgOutbound — not the chat identity — so Twilio
-   * does not relay them as new SMS (see mirrorProgrammableOutboundToConversation).
-   * Set SMS_LOG_SYNC_OUTBOUND_MIRROR=false to skip outbound rows (e.g. debugging).
+   * Outbound log mirror: OFF by default — importing outbound rows can surprise-bill if anything
+   * misbehaves; use the programmable-messaging webhook + set SMS_LOG_SYNC_OUTBOUND_MIRROR=true when needed.
    */
-  const outboundMirrorEnv = String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR ?? 'true').toLowerCase();
-  const allowOutboundMirror = !['false', '0', 'no', 'off'].includes(outboundMirrorEnv);
+  const outboundMirrorEnv = String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR ?? 'false').toLowerCase();
+  const allowOutboundMirror = ['true', '1', 'yes', 'on'].includes(outboundMirrorEnv);
 
   const ourSenders = collectOurOutboundSenderE164List();
-  const toUs = await pageAllProgrammableMessages({ to: our, dateSentAfter });
-  const fromLists = await Promise.all(
-    ourSenders.map((fromNum) =>
-      pageAllProgrammableMessages({ from: fromNum, dateSentAfter })
-    )
-  );
+  const toUs = await pageAllProgrammableMessages({ to: our, dateSentAfter }, shouldCancel);
+  if (shouldCancel()) {
+    return {
+      imported: 0,
+      skipped: 0,
+      skippedOutboundPolicy: 0,
+      outboundMirrorEnabled: allowOutboundMirror,
+      programmableMirrorAuthor: 'system',
+      scanned: 0,
+      conversationsTouched: 0,
+      cancelled: true,
+    };
+  }
+  /** Sequential (not Promise.all) so cancel can land between sender queries. */
+  const fromLists = [];
+  for (const fromNum of ourSenders) {
+    if (shouldCancel()) {
+      return {
+        imported: 0,
+        skipped: 0,
+        skippedOutboundPolicy: 0,
+        outboundMirrorEnabled: allowOutboundMirror,
+        programmableMirrorAuthor: 'system',
+        scanned: 0,
+        conversationsTouched: 0,
+        cancelled: true,
+      };
+    }
+    fromLists.push(
+      await pageAllProgrammableMessages({ from: fromNum, dateSentAfter }, shouldCancel)
+    );
+  }
+  if (shouldCancel()) {
+    return {
+      imported: 0,
+      skipped: 0,
+      skippedOutboundPolicy: 0,
+      outboundMirrorEnabled: allowOutboundMirror,
+      programmableMirrorAuthor: 'system',
+      scanned: 0,
+      conversationsTouched: 0,
+      cancelled: true,
+    };
+  }
 
   const inboundSidSet = new Set(toUs.map((m) => m.sid));
   const outboundSidSet = new Set();
@@ -482,9 +528,13 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
   for (const list of fromLists) {
     for (const m of list) bySid.set(m.sid, m);
   }
-  const merged = [...bySid.values()].sort(
+  let merged = [...bySid.values()].sort(
     (a, b) => (a.dateSent?.getTime?.() ?? 0) - (b.dateSent?.getTime?.() ?? 0)
   );
+  if (Number.isFinite(maxMessages) && maxMessages > 0) {
+    const cap = Math.min(Math.floor(maxMessages), merged.length);
+    merged = merged.slice(-cap);
+  }
 
   let imported = 0;
   let skipped = 0;
@@ -492,6 +542,18 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
   const convTouched = new Set();
 
   for (const sm of merged) {
+    if (shouldCancel()) {
+      return {
+        imported,
+        skipped,
+        skippedOutboundPolicy,
+        outboundMirrorEnabled: allowOutboundMirror,
+        programmableMirrorAuthor: 'system',
+        scanned: merged.length,
+        conversationsTouched: convTouched.size,
+        cancelled: true,
+      };
+    }
     const { kind, customer } = classifyBySmsLogQuery(sm, inboundSidSet, outboundSidSet);
     if (!customer || kind === 'unknown') {
       skipped++;
@@ -503,8 +565,32 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
     if (!bodyText.trim()) bodyText = ' ';
 
     try {
+      if (shouldCancel()) {
+        return {
+          imported,
+          skipped,
+          skippedOutboundPolicy,
+          outboundMirrorEnabled: allowOutboundMirror,
+          programmableMirrorAuthor: 'system',
+          scanned: merged.length,
+          conversationsTouched: convTouched.size,
+          cancelled: true,
+        };
+      }
       const { conversationSid: convSid } =
         await findOrCreateConversationForCustomerAddress(customer);
+      if (shouldCancel()) {
+        return {
+          imported,
+          skipped,
+          skippedOutboundPolicy,
+          outboundMirrorEnabled: allowOutboundMirror,
+          programmableMirrorAuthor: 'system',
+          scanned: merged.length,
+          conversationsTouched: convTouched.size,
+          cancelled: true,
+        };
+      }
       await ensureChatParticipantInConversation(convSid);
       convTouched.add(convSid);
 
@@ -528,6 +614,18 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
           skipped++;
           continue;
         }
+        if (shouldCancel()) {
+          return {
+            imported,
+            skipped,
+            skippedOutboundPolicy,
+            outboundMirrorEnabled: allowOutboundMirror,
+            programmableMirrorAuthor: 'system',
+            scanned: merged.length,
+            conversationsTouched: convTouched.size,
+            cancelled: true,
+          };
+        }
         await mirrorProgrammableOutboundToConversation(
           convSid,
           bodyText,
@@ -539,6 +637,18 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
         if (skipNative) {
           skipped++;
           continue;
+        }
+        if (shouldCancel()) {
+          return {
+            imported,
+            skipped,
+            skippedOutboundPolicy,
+            outboundMirrorEnabled: allowOutboundMirror,
+            programmableMirrorAuthor: 'system',
+            scanned: merged.length,
+            conversationsTouched: convTouched.size,
+            cancelled: true,
+          };
         }
         const parsed = toE164Australian(customer);
         const customerE164 = parsed.ok ? parsed.e164 : customer.trim();
@@ -566,6 +676,7 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
     programmableMirrorAuthor: 'system',
     scanned: merged.length,
     conversationsTouched: convTouched.size,
+    cancelled: false,
   };
 }
 
@@ -918,9 +1029,15 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
  * POST /api/sync-sms-log
  * Header: Authorization: Bearer <sessionJwt>
  * Body (optional): { daysBack?: number } — default 30, max 90.
+ * Optional maxMessages?: number — after loading the window, only process the N newest log rows (cap 500).
  * Reads Twilio Programmable Messaging (the SMS/MMS log in Console) and mirrors each
  * message into the matching Conversation so the inbox matches what you see under Logs.
  */
+app.post('/api/sync-sms-log/cancel', requireSession, (_req, res) => {
+  smsLogSyncCancelRequested = true;
+  return res.json({ ok: true });
+});
+
 app.post('/api/sync-sms-log', requireSession, async (req, res) => {
   const raw = req.body?.daysBack;
   const daysBack =
@@ -929,14 +1046,30 @@ app.post('/api/sync-sms-log', requireSession, async (req, res) => {
       : typeof raw === 'string'
         ? Number.parseInt(raw, 10)
         : 30;
+  const rawMax = req.body?.maxMessages;
+  let maxMessages;
+  if (typeof rawMax === 'number' && Number.isFinite(rawMax)) {
+    maxMessages = Math.min(Math.max(Math.floor(rawMax), 1), 500);
+  } else if (typeof rawMax === 'string') {
+    const p = Number.parseInt(rawMax, 10);
+    if (Number.isFinite(p)) maxMessages = Math.min(Math.max(p, 1), 500);
+  }
+  smsLogSyncCancelRequested = false;
   try {
+    const shouldCancel = () =>
+      smsLogSyncCancelRequested ||
+      Boolean(req.destroyed || req.aborted || req.socket?.destroyed);
     const result = await syncProgrammableSmsLogIntoConversations(
-      Number.isFinite(daysBack) ? daysBack : 30
+      Number.isFinite(daysBack) ? daysBack : 30,
+      shouldCancel,
+      maxMessages != null ? { maxMessages } : {}
     );
     return res.json(result);
   } catch (err) {
     console.error('Sync SMS log error:', err);
     return res.status(500).json({ error: err?.message || 'SMS log sync failed.' });
+  } finally {
+    smsLogSyncCancelRequested = false;
   }
 });
 
