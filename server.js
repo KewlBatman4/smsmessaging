@@ -667,12 +667,53 @@ async function listConversationSidsForIdentity() {
 }
 
 /**
+ * Collapse duplicate conversation rows that represent the same customer thread.
+ * Prefer the newest conversation when multiple SIDs share a friendly name / customer number.
+ */
+function conversationThreadKey(friendlyName, sid) {
+  const raw = String(friendlyName || '').trim();
+  if (!raw) return `sid:${sid}`;
+  const smsMatch = raw.match(/^SMS\s+(.+)$/i);
+  const candidate = smsMatch ? smsMatch[1].trim() : raw;
+  const canonical = canonicalCustomerE164(candidate);
+  if (canonical) return `cust:${canonical}`;
+  return `name:${raw.toLowerCase()}`;
+}
+
+async function collapseConversationSidsByThread(conversationSids) {
+  if (!conversationSids.length) return [];
+  const byKey = new Map();
+  for (const sid of conversationSids) {
+    try {
+      const conv = await twilioClient.conversations.v1
+        .services(serviceSid)
+        .conversations(sid)
+        .fetch();
+      const key = conversationThreadKey(conv.friendlyName, sid);
+      const updated = conv.dateUpdated?.getTime?.() ?? 0;
+      const prev = byKey.get(key);
+      if (!prev || updated >= prev.updated) {
+        byKey.set(key, { sid, updated });
+      }
+    } catch (e) {
+      const key = `sid:${sid}`;
+      if (!byKey.has(key)) byKey.set(key, { sid, updated: 0 });
+      console.warn('collapseConversationSidsByThread', sid, e?.message);
+    }
+  }
+  return [...byKey.values()]
+    .sort((a, b) => b.updated - a.updated)
+    .map((x) => x.sid);
+}
+
+/**
  * GET /api/conversation-sids
  * Header: Authorization: Bearer <sessionJwt>
  */
 app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   try {
-    const conversationSids = await listConversationSidsForIdentity();
+    const rawConversationSids = await listConversationSidsForIdentity();
+    const conversationSids = await collapseConversationSidsByThread(rawConversationSids);
     return res.json({ conversationSids });
   } catch (err) {
     console.error('List conversations error:', err);
