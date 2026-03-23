@@ -399,6 +399,18 @@ function fromMatchesAnyOurSender(from) {
   return ourSenderDigitSets.some((x) => x === d);
 }
 
+/** E.164 list for web UI: treat last message from these as non-unread. */
+function listOurSmsE164sForClient() {
+  const out = new Set();
+  const addDigits = (d) => {
+    const x = String(d || '').replace(/\D/g, '');
+    if (x) out.add(`+${x}`);
+  };
+  addDigits(twilioPhone);
+  for (const x of ourSenderDigitSets) addDigits(x);
+  return [...out];
+}
+
 /** Dedupe Programmable Messaging status callbacks (sent + delivered, retries). */
 const mirroredProgrammableMessageSids = new Set();
 const MIRROR_SID_CAP = 8000;
@@ -1073,6 +1085,7 @@ app.post('/api/token', requireSession, (_req, res) => {
       token: twilioJwt,
       identity: twilioChatIdentity,
       expiresIn: 3600,
+      ourSmsE164s: listOurSmsE164sForClient(),
     });
   } catch (err) {
     console.error('Token error:', err);
