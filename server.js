@@ -829,13 +829,23 @@ async function resolveConversationCustomerE164(conversationSid) {
     if (m) {
       const c = canonicalCustomerE164(m[1].trim());
       if (c) return c;
+    } else if (/^SMS/i.test(fn)) {
+      const rest = fn.replace(/^SMS\s*/i, '').trim();
+      const c = canonicalCustomerE164(rest);
+      if (c) return c;
     }
     const parts = await twilioClient.conversations.v1
       .services(serviceSid)
       .conversations(conversationSid)
       .participants.list();
     for (const p of parts) {
-      const addr = p.messagingBinding?.address;
+      const mb = p.messagingBinding;
+      const addr =
+        mb &&
+        (mb.address ||
+          mb.Address ||
+          mb.participant_address ||
+          mb.participantAddress);
       if (addr) {
         const c = canonicalCustomerE164(addr);
         if (c) return c;
@@ -885,7 +895,9 @@ async function listConversationSidsForIdentity() {
 app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   try {
     const conversationSids = await listConversationSidsForIdentity();
-    return res.json({ conversationSids });
+    /** Also returned so the web client can drop the same threads from Twilio SDK’s subscribed list. */
+    const hiddenCustomerE164 = [...hiddenCustomerE164Set()];
+    return res.json({ conversationSids, hiddenCustomerE164 });
   } catch (err) {
     console.error('List conversations error:', err);
     return res.status(500).json({ error: 'Failed to list conversations.' });
