@@ -108,6 +108,7 @@ let nativePushLastResult = null;
 let nativePushLastFailures = [];
 let lastConversationsWebhook = null;
 const recentConversationsWebhooks = [];
+const seenConversationSids = new Set();
 
 function recordConversationsWebhookSnapshot(snapshot) {
   recentConversationsWebhooks.unshift({
@@ -642,9 +643,17 @@ app.post(
         author !== 'system' &&
         author !== twilioChatIdentity;
       const isConversationAddedEvent = event === 'onConversationAdded';
-      if (hasPushTargets && (isInboundMessageEvent || isConversationAddedEvent)) {
+      const isFirstSeenConversationMessage =
+        event === 'onMessageAdded' && convSid && !seenConversationSids.has(convSid);
+      if (convSid) {
+        seenConversationSids.add(convSid);
+      }
+      if (
+        hasPushTargets &&
+        (isInboundMessageEvent || isConversationAddedEvent || isFirstSeenConversationMessage)
+      ) {
         try {
-          const preview = isConversationAddedEvent
+          const preview = isConversationAddedEvent || isFirstSeenConversationMessage
             ? 'New conversation started'
             : pushPreviewText(bodyText) || 'New message received';
           const notifyPayload = {
