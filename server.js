@@ -78,17 +78,6 @@ function programmableStatusMirrorEnabled() {
   );
 }
 
-/**
- * SMS log sync → Conversations is ON by default so Sync inbox pulls inbound history into the app.
- * Set SMS_LOG_SYNC_WRITE_CONVERSATIONS=false only as an emergency stop. Outbound log rows stay a
- * separate opt-in (SMS_LOG_SYNC_OUTBOUND_MIRROR); status-callback mirror is TWILIO_PROGRAMMABLE_STATUS_MIRROR.
- */
-function syncConversationWritesEnabled() {
-  const v = process.env.SMS_LOG_SYNC_WRITE_CONVERSATIONS;
-  if (v == null || String(v).trim() === '') return true;
-  return !['false', '0', 'no', 'off'].includes(String(v).trim().toLowerCase());
-}
-
 /** Browser Origin never has a trailing slash; strip so CORS matches Netlify exactly. */
 function corsOriginOption() {
   const raw = process.env.CORS_ORIGIN;
@@ -161,80 +150,6 @@ function fromMatchesAnyOurSender(from) {
   if (fromMatchesOurTwilioNumber(from)) return true;
   const d = digitsOnly(from);
   return ourSenderDigitSets.some((x) => x === d);
-}
-
-/** E.164 for every number we send SMS from (primary + TWILIO_SMS_FROM_ALIASES). */
-function collectOurOutboundSenderE164List() {
-  const out = [proxyNumberE164()];
-  const raw = (process.env.TWILIO_SMS_FROM_ALIASES || '').split(',');
-  for (const part of raw) {
-    const t = part.trim();
-    if (!t) continue;
-    let e164 = null;
-    if (t.startsWith('+')) {
-      e164 = `+${digitsOnly(t)}`;
-    } else {
-      const p = toE164Australian(t);
-      e164 = p.ok ? p.e164 : null;
-      if (!e164 && digitsOnly(t).length >= 10) e164 = `+${digitsOnly(t)}`;
-    }
-    if (e164 && digitsOnly(e164).length >= 10) out.push(e164);
-  }
-  return [...new Set(out)];
-}
-
-/**
- * Use Twilio Message `direction` when present; else From/To vs our senders.
- * Prefer classifyBySmsLogQuery() during sync — it uses which API query returned the SID.
- */
-function classifyProgrammableSms(sm) {
-  const d = String(sm.direction || '').trim().toLowerCase();
-  const from = rawPhoneFromTwilioAddr(sm.from);
-  const to = rawPhoneFromTwilioAddr(sm.to);
-
-  if (d === 'inbound' && from) {
-    return { kind: 'inbound', customer: from };
-  }
-  if (
-    (d === 'outbound-api' || d === 'outbound-call' || d === 'outbound-reply') &&
-    to
-  ) {
-    return { kind: 'outbound', customer: to };
-  }
-
-  if (fromMatchesAnyOurSender(sm.from) && to) {
-    return { kind: 'outbound', customer: to };
-  }
-  if (fromMatchesOurTwilioNumber(sm.to) && from) {
-    return { kind: 'inbound', customer: from };
-  }
-
-  return { kind: 'unknown', customer: null };
-}
-
-/**
- * Definitive for sync: message was listed under To=our → inbound; under From=one-of-ours → outbound.
- * Fixes Zapier + Messaging Service when From is a pool number not in TWILIO_PHONE_NUMBER.
- */
-function classifyBySmsLogQuery(sm, inboundSidSet, outboundSidSet) {
-  const inIn = inboundSidSet.has(sm.sid);
-  const inOut = outboundSidSet.has(sm.sid);
-  if (inIn && !inOut) {
-    return {
-      kind: 'inbound',
-      customer: rawPhoneFromTwilioAddr(sm.from),
-    };
-  }
-  if (inOut && !inIn) {
-    return {
-      kind: 'outbound',
-      customer: rawPhoneFromTwilioAddr(sm.to),
-    };
-  }
-  if (inIn && inOut) {
-    return classifyProgrammableSms(sm);
-  }
-  return { kind: 'unknown', customer: null };
 }
 
 /** Dedupe Programmable Messaging status callbacks (sent + delivered, retries). */
@@ -314,13 +229,13 @@ async function createSmsConversationForCustomerE164(customerE164) {
 }
 
 /**
- * Find an existing conversation for this customer address, or create one (Zapier-first outbound).
- * @returns {{ conversationSid: string, created: boolean }}
+ * Shared ParticipantConversation lookup (multi-variant address).
+ * @returns {{ ok: true, e164: string, rows: unknown[] } | { ok: false, error: string }}
  */
-async function findOrCreateConversationForCustomerAddress(customerAddress) {
+async function resolveCustomerConversationLookup(customerAddress) {
   const e164 = canonicalCustomerE164(customerAddress);
   if (!e164) {
-    throw new Error(`Invalid customer phone address: ${String(customerAddress)}`);
+    return { ok: false, error: `Invalid customer phone address: ${String(customerAddress)}` };
   }
   const raw =
     rawPhoneFromTwilioAddr(String(customerAddress).trim()) ||
@@ -338,19 +253,20 @@ async function findOrCreateConversationForCustomerAddress(customerAddress) {
   for (const addr of lookupAddresses) {
     rows.push(...(await listParticipantConversationRowsForAddress(addr)));
   }
-  const existing = pickConversationSidForCustomer(rows);
-  if (existing) return { conversationSid: existing, created: false };
-  const sid = await createSmsConversationForCustomerE164(e164);
-  return { conversationSid: sid, created: true };
+  return { ok: true, e164, rows };
 }
 
-function parseConversationAttributes(raw) {
-  if (!raw || typeof raw !== 'string') return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+/**
+ * Find an existing conversation for this customer address, or create one (Zapier-first outbound).
+ * @returns {{ conversationSid: string, created: boolean }}
+ */
+async function findOrCreateConversationForCustomerAddress(customerAddress) {
+  const r = await resolveCustomerConversationLookup(customerAddress);
+  if (!r.ok) throw new Error(r.error);
+  const existing = pickConversationSidForCustomer(r.rows);
+  if (existing) return { conversationSid: existing, created: false };
+  const sid = await createSmsConversationForCustomerE164(r.e164);
+  return { conversationSid: sid, created: true };
 }
 
 async function mirrorProgrammableOutboundToConversation(
@@ -364,7 +280,7 @@ async function mirrorProgrammableOutboundToConversation(
     programmaticMessageSid: messageSid,
   });
   // Never use TWILIO_CONVERSATIONS_IDENTITY here — Twilio relays chat-participant messages as SMS.
-  // Set Author explicitly to "system" (same as inbound mirrors); the web app uses attributes.pbsgOutbound.
+  // Author "system" + attributes.pbsgOutbound for right-aligned bubbles in the web app.
   const createParams = {
     author: 'system',
     body: bodyText,
@@ -378,31 +294,6 @@ async function mirrorProgrammableOutboundToConversation(
     .messages.create(createParams);
 }
 
-async function mirrorProgrammableInboundToConversation(
-  conversationSid,
-  bodyText,
-  messageSid,
-  customerE164,
-  dateCreated
-) {
-  const attrs = JSON.stringify({
-    pbsgInbound: true,
-    programmaticMessageSid: messageSid,
-    fromAddress: customerE164,
-  });
-  const params = {
-    author: 'system',
-    body: bodyText,
-    attributes: attrs,
-  };
-  if (dateCreated) params.dateCreated = dateCreated;
-  params.xTwilioWebhookEnabled = 'false';
-  await twilioClient.conversations.v1
-    .services(serviceSid)
-    .conversations(conversationSid)
-    .messages.create(params);
-}
-
 function rawPhoneFromTwilioAddr(addr) {
   if (!addr || typeof addr !== 'string') return null;
   const s = addr.trim();
@@ -412,308 +303,6 @@ function rawPhoneFromTwilioAddr(addr) {
   }
   if (/^[a-z]+:/i.test(s)) return null;
   return s;
-}
-
-async function conversationAlreadyHasMirroredProgrammableSid(conversationSid, smSid) {
-  let page = await twilioClient.conversations.v1
-    .services(serviceSid)
-    .conversations(conversationSid)
-    .messages.page({ order: 'desc', pageSize: 100 });
-  for (let i = 0; i < 10; i++) {
-    for (const msg of page.instances) {
-      const a = parseConversationAttributes(msg.attributes);
-      if (a?.programmaticMessageSid === smSid) return true;
-    }
-    if (!page.nextPageUrl) break;
-    page = await page.nextPage();
-  }
-  return false;
-}
-
-/** Skip mirror when Conversations already has the same inbound from Twilio’s native SMS path. */
-async function likelyNativeInboundDuplicate(conversationSid, bodyText, smDate) {
-  const want = (bodyText || '').trim();
-  if (!want) return false;
-  const smT = smDate?.getTime?.() ?? 0;
-  if (!smT) return false;
-  const page = await twilioClient.conversations.v1
-    .services(serviceSid)
-    .conversations(conversationSid)
-    .messages.page({ order: 'desc', pageSize: 40 });
-  for (const msg of page.instances) {
-    const a = parseConversationAttributes(msg.attributes);
-    if (a?.programmaticMessageSid || a?.pbsgOutbound) continue;
-    if ((msg.body || '').trim() !== want) continue;
-    const t = msg.dateCreated?.getTime?.() ?? 0;
-    if (t > 0 && Math.abs(t - smT) < 120_000) return true;
-  }
-  return false;
-}
-
-const SMS_LOG_MAX_PAGES_PER_DIRECTION = 60;
-
-/** Set true by POST /api/sync-sms-log/cancel; cleared when a sync run finishes. */
-let smsLogSyncCancelRequested = false;
-
-async function pageAllProgrammableMessages(listParams, shouldCancel = () => false) {
-  const out = [];
-  if (shouldCancel()) return out;
-  let page = await twilioClient.messages.page({
-    ...listParams,
-    pageSize: 100,
-  });
-  for (let i = 0; i < SMS_LOG_MAX_PAGES_PER_DIRECTION; i++) {
-    if (shouldCancel()) return out;
-    out.push(...page.instances);
-    if (!page.nextPageUrl) break;
-    if (shouldCancel()) return out;
-    page = await page.nextPage();
-  }
-  return out;
-}
-
-/**
- * Pull Twilio Programmable Messaging (SMS log) and append missing rows into Conversations
- * so the web app can show traffic that never entered the Conversation service.
- */
-async function syncProgrammableSmsLogIntoConversations(
-  daysBack,
-  shouldCancel = () => false,
-  { maxMessages } = {}
-) {
-  if (!syncConversationWritesEnabled()) {
-    return {
-      imported: 0,
-      skipped: 0,
-      skippedOutboundPolicy: 0,
-      outboundMirrorEnabled: false,
-      syncConversationWrites: false,
-      hint:
-        'SMS log sync writes are off: SMS_LOG_SYNC_WRITE_CONVERSATIONS=false. Remove that variable or set true to import history again.',
-      programmableMirrorAuthor: 'system',
-      scanned: 0,
-      conversationsTouched: 0,
-      cancelled: false,
-    };
-  }
-
-  const our = proxyNumberE164();
-  const dateSentAfter = new Date(Date.now() - Math.min(Math.max(daysBack, 1), 90) * 86400000);
-  /**
-   * Outbound log mirror: OFF by default — importing outbound rows can surprise-bill if anything
-   * misbehaves; use the programmable-messaging webhook + set SMS_LOG_SYNC_OUTBOUND_MIRROR=true when needed.
-   */
-  const outboundMirrorEnv = String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR ?? 'false').toLowerCase();
-  const allowOutboundMirror = ['true', '1', 'yes', 'on'].includes(outboundMirrorEnv);
-
-  const ourSenders = collectOurOutboundSenderE164List();
-  const toUs = await pageAllProgrammableMessages({ to: our, dateSentAfter }, shouldCancel);
-  if (shouldCancel()) {
-    return {
-      imported: 0,
-      skipped: 0,
-      skippedOutboundPolicy: 0,
-      outboundMirrorEnabled: allowOutboundMirror,
-      programmableMirrorAuthor: 'system',
-      scanned: 0,
-      conversationsTouched: 0,
-      cancelled: true,
-    };
-  }
-  /** Sequential (not Promise.all) so cancel can land between sender queries. */
-  const fromLists = [];
-  for (const fromNum of ourSenders) {
-    if (shouldCancel()) {
-      return {
-        imported: 0,
-        skipped: 0,
-        skippedOutboundPolicy: 0,
-        outboundMirrorEnabled: allowOutboundMirror,
-        programmableMirrorAuthor: 'system',
-        scanned: 0,
-        conversationsTouched: 0,
-        cancelled: true,
-      };
-    }
-    fromLists.push(
-      await pageAllProgrammableMessages({ from: fromNum, dateSentAfter }, shouldCancel)
-    );
-  }
-  if (shouldCancel()) {
-    return {
-      imported: 0,
-      skipped: 0,
-      skippedOutboundPolicy: 0,
-      outboundMirrorEnabled: allowOutboundMirror,
-      programmableMirrorAuthor: 'system',
-      scanned: 0,
-      conversationsTouched: 0,
-      cancelled: true,
-    };
-  }
-
-  const inboundSidSet = new Set(toUs.map((m) => m.sid));
-  const outboundSidSet = new Set();
-  for (const list of fromLists) {
-    for (const m of list) outboundSidSet.add(m.sid);
-  }
-
-  const bySid = new Map();
-  for (const m of toUs) bySid.set(m.sid, m);
-  for (const list of fromLists) {
-    for (const m of list) bySid.set(m.sid, m);
-  }
-  let merged = [...bySid.values()].sort(
-    (a, b) => (a.dateSent?.getTime?.() ?? 0) - (b.dateSent?.getTime?.() ?? 0)
-  );
-  if (Number.isFinite(maxMessages) && maxMessages > 0) {
-    const cap = Math.min(Math.floor(maxMessages), merged.length);
-    merged = merged.slice(-cap);
-  }
-
-  let imported = 0;
-  let skipped = 0;
-  let skippedOutboundPolicy = 0;
-  const convTouched = new Set();
-
-  for (const sm of merged) {
-    if (shouldCancel()) {
-      return {
-        imported,
-        skipped,
-        skippedOutboundPolicy,
-        outboundMirrorEnabled: allowOutboundMirror,
-        programmableMirrorAuthor: 'system',
-        scanned: merged.length,
-        conversationsTouched: convTouched.size,
-        cancelled: true,
-      };
-    }
-    const { kind, customer } = classifyBySmsLogQuery(sm, inboundSidSet, outboundSidSet);
-    if (!customer || kind === 'unknown') {
-      skipped++;
-      continue;
-    }
-
-    let bodyText = sm.body != null ? String(sm.body) : '';
-    if (!bodyText.trim() && (sm.numMedia ?? 0) > 0) bodyText = '[Media]';
-    if (!bodyText.trim()) bodyText = ' ';
-
-    try {
-      if (shouldCancel()) {
-        return {
-          imported,
-          skipped,
-          skippedOutboundPolicy,
-          outboundMirrorEnabled: allowOutboundMirror,
-          programmableMirrorAuthor: 'system',
-          scanned: merged.length,
-          conversationsTouched: convTouched.size,
-          cancelled: true,
-        };
-      }
-      const { conversationSid: convSid } =
-        await findOrCreateConversationForCustomerAddress(customer);
-      if (shouldCancel()) {
-        return {
-          imported,
-          skipped,
-          skippedOutboundPolicy,
-          outboundMirrorEnabled: allowOutboundMirror,
-          programmableMirrorAuthor: 'system',
-          scanned: merged.length,
-          conversationsTouched: convTouched.size,
-          cancelled: true,
-        };
-      }
-      await ensureChatParticipantInConversation(convSid);
-      convTouched.add(convSid);
-
-      if (await conversationAlreadyHasMirroredProgrammableSid(convSid, sm.sid)) {
-        skipped++;
-        continue;
-      }
-
-      if (kind === 'outbound') {
-        if (!allowOutboundMirror) {
-          skippedOutboundPolicy++;
-          skipped++;
-          continue;
-        }
-        const skipWebDup = await recentChatAuthorMessageMatchesBody(
-          convSid,
-          bodyText,
-          25_000
-        );
-        if (skipWebDup) {
-          skipped++;
-          continue;
-        }
-        if (shouldCancel()) {
-          return {
-            imported,
-            skipped,
-            skippedOutboundPolicy,
-            outboundMirrorEnabled: allowOutboundMirror,
-            programmableMirrorAuthor: 'system',
-            scanned: merged.length,
-            conversationsTouched: convTouched.size,
-            cancelled: true,
-          };
-        }
-        await mirrorProgrammableOutboundToConversation(
-          convSid,
-          bodyText,
-          sm.sid,
-          sm.dateSent
-        );
-      } else {
-        const skipNative = await likelyNativeInboundDuplicate(convSid, bodyText, sm.dateSent);
-        if (skipNative) {
-          skipped++;
-          continue;
-        }
-        if (shouldCancel()) {
-          return {
-            imported,
-            skipped,
-            skippedOutboundPolicy,
-            outboundMirrorEnabled: allowOutboundMirror,
-            programmableMirrorAuthor: 'system',
-            scanned: merged.length,
-            conversationsTouched: convTouched.size,
-            cancelled: true,
-          };
-        }
-        const parsed = toE164Australian(customer);
-        const customerE164 = parsed.ok ? parsed.e164 : customer.trim();
-        await mirrorProgrammableInboundToConversation(
-          convSid,
-          bodyText,
-          sm.sid,
-          customerE164,
-          sm.dateSent
-        );
-      }
-      imported++;
-    } catch (e) {
-      console.warn('sync sms log row failed', sm.sid, e?.message);
-      skipped++;
-    }
-  }
-
-  return {
-    imported,
-    skipped,
-    skippedOutboundPolicy,
-    outboundMirrorEnabled: allowOutboundMirror,
-    syncConversationWrites: true,
-    /** Helps verify deploy: mirrors must use "system" or customers get duplicate SMS. */
-    programmableMirrorAuthor: 'system',
-    scanned: merged.length,
-    conversationsTouched: convTouched.size,
-    cancelled: false,
-  };
 }
 
 /** Avoid duplicating messages the user just sent from the web app (same SMS hits this webhook). */
@@ -1019,7 +608,7 @@ async function resolveConversationCustomerE164(conversationSid) {
 
 /**
  * List every Conversation SID where this service's chat identity is a participant.
- * Used so the inbox can show full history, not only what the JS SDK synced first.
+ * Used so the REST client can open the same threads the Conversations SDK subscribes to.
  */
 async function listConversationSidsForIdentity() {
   const sids = [];
@@ -1068,53 +657,6 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
  * Add the web inbox identity to every Conversation in this service that lacks it.
  * Use once after deploy or when old SMS-only threads never triggered onConversationAdded.
  */
-/**
- * POST /api/sync-sms-log
- * Header: Authorization: Bearer <sessionJwt>
- * Body (optional): { daysBack?: number } — default 30, max 90.
- * Optional maxMessages?: number — after loading the window, only process the N newest log rows (cap 500).
- * Reads Twilio Programmable Messaging (the SMS/MMS log in Console) and mirrors each
- * message into the matching Conversation so the inbox matches what you see under Logs.
- */
-app.post('/api/sync-sms-log/cancel', requireSession, (_req, res) => {
-  smsLogSyncCancelRequested = true;
-  return res.json({ ok: true });
-});
-
-app.post('/api/sync-sms-log', requireSession, async (req, res) => {
-  const raw = req.body?.daysBack;
-  const daysBack =
-    typeof raw === 'number' && Number.isFinite(raw)
-      ? raw
-      : typeof raw === 'string'
-        ? Number.parseInt(raw, 10)
-        : 30;
-  const rawMax = req.body?.maxMessages;
-  let maxMessages;
-  if (typeof rawMax === 'number' && Number.isFinite(rawMax)) {
-    maxMessages = Math.min(Math.max(Math.floor(rawMax), 1), 500);
-  } else if (typeof rawMax === 'string') {
-    const p = Number.parseInt(rawMax, 10);
-    if (Number.isFinite(p)) maxMessages = Math.min(Math.max(p, 1), 500);
-  }
-  smsLogSyncCancelRequested = false;
-  try {
-    /** Only the explicit cancel endpoint — req.aborted/socket flags are flaky behind proxies and caused instant "cancelled" syncs. */
-    const shouldCancel = () => smsLogSyncCancelRequested;
-    const result = await syncProgrammableSmsLogIntoConversations(
-      Number.isFinite(daysBack) ? daysBack : 30,
-      shouldCancel,
-      maxMessages != null ? { maxMessages } : {}
-    );
-    return res.json(result);
-  } catch (err) {
-    console.error('Sync SMS log error:', err);
-    return res.status(500).json({ error: err?.message || 'SMS log sync failed.' });
-  } finally {
-    smsLogSyncCancelRequested = false;
-  }
-});
-
 app.post('/api/repair-chat-participants', requireSession, async (_req, res) => {
   let scanned = 0;
   let added = 0;
@@ -1175,7 +717,6 @@ app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'pbsg-messenger-backend',
-    smsLogSyncWrites: syncConversationWritesEnabled(),
     programmableStatusCallbackMirror: programmableStatusMirrorEnabled(),
   });
 });
