@@ -145,9 +145,29 @@ function fromMatchesAnyOurSender(from) {
   return ourSenderDigitSets.some((x) => x === d);
 }
 
+/** E.164 for every number we send SMS from (primary + TWILIO_SMS_FROM_ALIASES). */
+function collectOurOutboundSenderE164List() {
+  const out = [proxyNumberE164()];
+  const raw = (process.env.TWILIO_SMS_FROM_ALIASES || '').split(',');
+  for (const part of raw) {
+    const t = part.trim();
+    if (!t) continue;
+    let e164 = null;
+    if (t.startsWith('+')) {
+      e164 = `+${digitsOnly(t)}`;
+    } else {
+      const p = toE164Australian(t);
+      e164 = p.ok ? p.e164 : null;
+      if (!e164 && digitsOnly(t).length >= 10) e164 = `+${digitsOnly(t)}`;
+    }
+    if (e164 && digitsOnly(e164).length >= 10) out.push(e164);
+  }
+  return [...new Set(out)];
+}
+
 /**
- * Use Twilio Message `direction` first (correct for Zapier / Messaging Service).
- * Falls back to From/To vs TWILIO_PHONE_NUMBER (+ TWILIO_SMS_FROM_ALIASES).
+ * Use Twilio Message `direction` when present; else From/To vs our senders.
+ * Prefer classifyBySmsLogQuery() during sync — it uses which API query returned the SID.
  */
 function classifyProgrammableSms(sm) {
   const d = String(sm.direction || '').trim().toLowerCase();
@@ -171,6 +191,31 @@ function classifyProgrammableSms(sm) {
     return { kind: 'inbound', customer: from };
   }
 
+  return { kind: 'unknown', customer: null };
+}
+
+/**
+ * Definitive for sync: message was listed under To=our → inbound; under From=one-of-ours → outbound.
+ * Fixes Zapier + Messaging Service when From is a pool number not in TWILIO_PHONE_NUMBER.
+ */
+function classifyBySmsLogQuery(sm, inboundSidSet, outboundSidSet) {
+  const inIn = inboundSidSet.has(sm.sid);
+  const inOut = outboundSidSet.has(sm.sid);
+  if (inIn && !inOut) {
+    return {
+      kind: 'inbound',
+      customer: rawPhoneFromTwilioAddr(sm.from),
+    };
+  }
+  if (inOut && !inIn) {
+    return {
+      kind: 'outbound',
+      customer: rawPhoneFromTwilioAddr(sm.to),
+    };
+  }
+  if (inIn && inOut) {
+    return classifyProgrammableSms(sm);
+  }
   return { kind: 'unknown', customer: null };
 }
 
@@ -210,6 +255,22 @@ function pickConversationSidForCustomer(rows) {
 }
 
 /**
+ * One E.164 form for the same mobile everywhere (lookup + messagingBinding).
+ * Without this, +61… vs 61… vs 04… hits different ParticipantConversation rows and splits the sidebar.
+ */
+function canonicalCustomerE164(customerAddress) {
+  if (!customerAddress || typeof customerAddress !== 'string') return null;
+  const stripped =
+    rawPhoneFromTwilioAddr(customerAddress.trim()) || customerAddress.trim();
+  if (!stripped) return null;
+  const parsed = toE164Australian(stripped);
+  if (parsed.ok) return parsed.e164;
+  const d = digitsOnly(stripped);
+  if (d.length >= 10) return `+${d}`;
+  return null;
+}
+
+/**
  * Create a new SMS conversation with chat + SMS participants (same as POST /api/conversations).
  */
 async function createSmsConversationForCustomerE164(customerE164) {
@@ -236,14 +297,33 @@ async function createSmsConversationForCustomerE164(customerE164) {
 
 /**
  * Find an existing conversation for this customer address, or create one (Zapier-first outbound).
+ * @returns {{ conversationSid: string, created: boolean }}
  */
 async function findOrCreateConversationForCustomerAddress(customerAddress) {
-  const rows = await listParticipantConversationRowsForAddress(customerAddress);
+  const e164 = canonicalCustomerE164(customerAddress);
+  if (!e164) {
+    throw new Error(`Invalid customer phone address: ${String(customerAddress)}`);
+  }
+  const raw =
+    rawPhoneFromTwilioAddr(String(customerAddress).trim()) ||
+    String(customerAddress).trim();
+  const lookupAddresses = [e164];
+  if (raw && raw !== e164 && !lookupAddresses.includes(raw)) {
+    lookupAddresses.push(raw);
+  }
+  const d = digitsOnly(raw);
+  const plusDigits = d.length >= 10 ? `+${d}` : null;
+  if (plusDigits && !lookupAddresses.includes(plusDigits)) {
+    lookupAddresses.push(plusDigits);
+  }
+  const rows = [];
+  for (const addr of lookupAddresses) {
+    rows.push(...(await listParticipantConversationRowsForAddress(addr)));
+  }
   const existing = pickConversationSidForCustomer(rows);
-  if (existing) return existing;
-  const parsed = toE164Australian(customerAddress);
-  const e164 = parsed.ok ? parsed.e164 : customerAddress.trim();
-  return createSmsConversationForCustomerE164(e164);
+  if (existing) return { conversationSid: existing, created: false };
+  const sid = await createSmsConversationForCustomerE164(e164);
+  return { conversationSid: sid, created: true };
 }
 
 function parseConversationAttributes(raw) {
@@ -265,8 +345,9 @@ async function mirrorProgrammableOutboundToConversation(
     pbsgOutbound: true,
     programmaticMessageSid: messageSid,
   });
+  // Same author as the web app so the UI aligns outbound bubbles to the right (not "system" / left).
   const params = {
-    author: 'system',
+    author: twilioChatIdentity,
     body: bodyText,
     attributes: attrs,
   };
@@ -378,14 +459,25 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
     String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR || '').toLowerCase()
   );
 
-  const [toUs, fromUs] = await Promise.all([
-    pageAllProgrammableMessages({ to: our, dateSentAfter }),
-    pageAllProgrammableMessages({ from: our, dateSentAfter }),
-  ]);
+  const ourSenders = collectOurOutboundSenderE164List();
+  const toUs = await pageAllProgrammableMessages({ to: our, dateSentAfter });
+  const fromLists = await Promise.all(
+    ourSenders.map((fromNum) =>
+      pageAllProgrammableMessages({ from: fromNum, dateSentAfter })
+    )
+  );
+
+  const inboundSidSet = new Set(toUs.map((m) => m.sid));
+  const outboundSidSet = new Set();
+  for (const list of fromLists) {
+    for (const m of list) outboundSidSet.add(m.sid);
+  }
 
   const bySid = new Map();
   for (const m of toUs) bySid.set(m.sid, m);
-  for (const m of fromUs) bySid.set(m.sid, m);
+  for (const list of fromLists) {
+    for (const m of list) bySid.set(m.sid, m);
+  }
   const merged = [...bySid.values()].sort(
     (a, b) => (a.dateSent?.getTime?.() ?? 0) - (b.dateSent?.getTime?.() ?? 0)
   );
@@ -396,7 +488,7 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
   const convTouched = new Set();
 
   for (const sm of merged) {
-    const { kind, customer } = classifyProgrammableSms(sm);
+    const { kind, customer } = classifyBySmsLogQuery(sm, inboundSidSet, outboundSidSet);
     if (!customer || kind === 'unknown') {
       skipped++;
       continue;
@@ -407,7 +499,8 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
     if (!bodyText.trim()) bodyText = ' ';
 
     try {
-      const convSid = await findOrCreateConversationForCustomerAddress(customer);
+      const { conversationSid: convSid } =
+        await findOrCreateConversationForCustomerAddress(customer);
       await ensureChatParticipantInConversation(convSid);
       convTouched.add(convSid);
 
@@ -536,8 +629,12 @@ app.post(
 
 /**
  * Programmable Messaging (Zapier, Messages API) status callback: mirror outbound SMS into
- * Twilio Conversations so PBSG Messenger shows the same thread. Uses Author=system plus
- * JSON attributes so we do not trigger a second SMS to the customer.
+ * Twilio Conversations so PBSG Messenger shows the same thread. Uses the same chat identity
+ * as the web app plus JSON attributes and xTwilioWebhookEnabled=false so we do not trigger
+ * a second SMS to the customer.
+ *
+ * Fetches the Message resource so direction and pool "From" numbers are correct (Zapier /
+ * Messaging Service senders need not match TWILIO_PHONE_NUMBER).
  *
  * Configure Status Callback URL (phone number, Messaging Service, or per Zapier send) to:
  *   https://YOUR-API/api/webhooks/twilio/programmable-messaging
@@ -553,18 +650,30 @@ app.post(
 
     const messageSid = req.body.MessageSid || req.body.SmsSid;
     const statusRaw = (req.body.MessageStatus || req.body.SmsStatus || '').toLowerCase();
-    const direction = (req.body.Direction || '').toLowerCase();
 
     if (!messageSid || statusRaw !== 'sent') {
       return res.status(200).end();
     }
-    if (direction && !direction.startsWith('outbound')) {
+
+    let fetched = null;
+    try {
+      fetched = await twilioClient.messages(messageSid).fetch();
+    } catch (e) {
+      console.warn('programmable-messaging webhook: could not fetch message', messageSid, e?.message);
+    }
+
+    const dir = String(fetched?.direction ?? req.body.Direction ?? '').toLowerCase();
+    if (!dir.startsWith('outbound')) {
       return res.status(200).end();
     }
 
-    const from = req.body.From;
-    const to = req.body.To;
-    if (!from || !to || !fromMatchesAnyOurSender(from)) {
+    const from = fetched?.from || req.body.From;
+    const to = fetched?.to || req.body.To;
+    if (!from || !to) {
+      return res.status(200).end();
+    }
+    // Pool / Messaging Service "From" may not match TWILIO_PHONE_NUMBER; API direction is authoritative.
+    if (!fetched && !fromMatchesAnyOurSender(from)) {
       return res.status(200).end();
     }
 
@@ -576,18 +685,13 @@ app.post(
     if (!bodyText && req.body.NumMedia && Number(req.body.NumMedia) > 0) {
       bodyText = '[Media]';
     }
-
-    try {
-      if (!bodyText) {
-        const m = await twilioClient.messages(messageSid).fetch();
-        bodyText = (m.body && String(m.body)) || '';
-      }
-    } catch (e) {
-      console.warn('programmable-messaging webhook: could not fetch message body', messageSid, e?.message);
+    if (!bodyText && fetched?.body) {
+      bodyText = String(fetched.body);
     }
 
     try {
-      const convSid = await findOrCreateConversationForCustomerAddress(to);
+      const { conversationSid: convSid } =
+        await findOrCreateConversationForCustomerAddress(to);
       await ensureChatParticipantInConversation(convSid);
       const skipDuplicateWebSend = await recentChatAuthorMessageMatchesBody(
         convSid,
@@ -701,6 +805,48 @@ app.post('/api/token', requireSession, (_req, res) => {
  * Header: Authorization: Bearer <sessionJwt>
  * Body: { to: string (phone) }
  */
+/** Customer E.164 values to omit from GET /api/conversation-sids (comma-separated in HIDDEN_SMS_CUSTOMER_E164). */
+function hiddenCustomerE164Set() {
+  const set = new Set();
+  for (const part of String(process.env.HIDDEN_SMS_CUSTOMER_E164 || '').split(',')) {
+    const c = canonicalCustomerE164(part.trim());
+    if (c) set.add(c);
+  }
+  return set;
+}
+
+/**
+ * Best-effort customer number for filtering (friendlyName "SMS +61…" or SMS participant binding).
+ */
+async function resolveConversationCustomerE164(conversationSid) {
+  try {
+    const conv = await twilioClient.conversations.v1
+      .services(serviceSid)
+      .conversations(conversationSid)
+      .fetch();
+    const fn = (conv.friendlyName || '').trim();
+    const m = fn.match(/^SMS\s+(.+)$/i);
+    if (m) {
+      const c = canonicalCustomerE164(m[1].trim());
+      if (c) return c;
+    }
+    const parts = await twilioClient.conversations.v1
+      .services(serviceSid)
+      .conversations(conversationSid)
+      .participants.list();
+    for (const p of parts) {
+      const addr = p.messagingBinding?.address;
+      if (addr) {
+        const c = canonicalCustomerE164(addr);
+        if (c) return c;
+      }
+    }
+  } catch (e) {
+    console.warn('resolveConversationCustomerE164', conversationSid, e?.message);
+  }
+  return null;
+}
+
 /**
  * List every Conversation SID where this service's chat identity is a participant.
  * Used so the inbox can show full history, not only what the JS SDK synced first.
@@ -720,7 +866,16 @@ async function listConversationSidsForIdentity() {
     if (!page.nextPageUrl) break;
     page = await page.nextPage();
   }
-  return [...new Set(sids)];
+  const unique = [...new Set(sids)];
+  const hidden = hiddenCustomerE164Set();
+  if (!hidden.size) return unique;
+  const out = [];
+  for (const sid of unique) {
+    const cust = await resolveConversationCustomerE164(sid);
+    if (cust && hidden.has(cust)) continue;
+    out.push(sid);
+  }
+  return out;
 }
 
 /**
@@ -805,12 +960,13 @@ app.post('/api/conversations', requireSession, async (req, res) => {
   }
 
   try {
-    const sid = await createSmsConversationForCustomerE164(phone.e164);
+    const { conversationSid: sid, created } =
+      await findOrCreateConversationForCustomerAddress(phone.e164);
     const conv = await twilioClient.conversations.v1
       .services(serviceSid)
       .conversations(sid)
       .fetch();
-    return res.status(201).json({
+    return res.status(created ? 201 : 200).json({
       conversationSid: sid,
       friendlyName: conv.friendlyName,
     });

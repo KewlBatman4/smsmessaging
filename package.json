@@ -7,7 +7,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "hash-password": "node scripts/hash-password.mjs",
-    "create-conversations-service": "node scripts/create-conversations-service.mjs"
+    "create-conversations-service": "node scripts/create-conversations-service.mjs",
+    "wipe-conversations": "node scripts/wipe-all-conversations.mjs"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
