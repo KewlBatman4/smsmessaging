@@ -29,6 +29,13 @@ function trelloRelayE164() {
   return p.ok ? p.e164 : '+61468167025';
 }
 
+/** E.164 sender number used to forward relay payloads into TRELLO_RELAY_E164. */
+function trelloRelaySourceE164() {
+  const raw = (process.env.TRELLO_RELAY_SOURCE_E164 || '+61468162324').trim();
+  const p = toE164Australian(raw.startsWith('+') ? raw : `+${raw.replace(/\D/g, '')}`);
+  return p.ok ? p.e164 : '+61468162324';
+}
+
 const sessionJwtSecret = process.env.SESSION_JWT_SECRET;
 const appPasswordHash = process.env.APP_PASSWORD_HASH;
 const sessionMaxAgeSec = Number(process.env.SESSION_MAX_AGE_SECONDS) || 604800; // 7 days
@@ -485,7 +492,8 @@ app.post(
 );
 
 /**
- * Inbound SMS webhook: self-SMS to TRELLO_RELAY_E164 with &&FROM…&& / && REPLY && body.
+ * Inbound SMS webhook: relay SMS from TRELLO_RELAY_SOURCE_E164 to TRELLO_RELAY_E164
+ * with &&FROM…&& / && REPLY && body.
  * Stores display-only messages in memory for GET /api/trello-relay/* — does not call Conversations API.
  *
  * Twilio Console → Phone number → A message comes in → Webhook URL:
@@ -500,12 +508,13 @@ app.post(
       return res.status(403).send('Forbidden');
     }
     const relay = trelloRelayE164();
+    const relaySource = trelloRelaySourceE164();
     const from = req.body.From || req.body.from;
     const to = req.body.To || req.body.to;
     if (
       !from ||
       !to ||
-      canonicalCustomerE164(from) !== relay ||
+      canonicalCustomerE164(from) !== relaySource ||
       canonicalCustomerE164(to) !== relay
     ) {
       return res.status(200).type('text/xml').send('<Response></Response>');
