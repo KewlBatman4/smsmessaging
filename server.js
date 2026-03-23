@@ -106,6 +106,7 @@ let nativePushLastSuccessAt = null;
 let nativePushLastError = null;
 let nativePushLastResult = null;
 let nativePushLastFailures = [];
+let lastConversationsWebhook = null;
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
 function programmableStatusMirrorEnabled() {
@@ -566,14 +567,27 @@ app.post(
   '/api/webhooks/twilio/conversations',
   express.urlencoded({ extended: false }),
   async (req, res) => {
+    const now = new Date().toISOString();
+    const event = req.body.EventType || req.body.eventType || '';
+    const convSid = req.body.ConversationSid || req.body.conversationSid || '';
+    const messageSid = req.body.MessageSid || req.body.messageSid || '';
+    const author = req.body.Author || req.body.author || '';
+    lastConversationsWebhook = {
+      at: now,
+      event,
+      conversationSid: convSid || null,
+      messageSid: messageSid || null,
+      author: author || null,
+      signatureValid: null,
+      status: 'received',
+    };
     if (!validateTwilioWebhookSignature(req)) {
+      lastConversationsWebhook.signatureValid = false;
+      lastConversationsWebhook.status = 'forbidden_signature';
       return res.status(403).send('Forbidden');
     }
-    const event = req.body.EventType || req.body.eventType;
-    const convSid = req.body.ConversationSid || req.body.conversationSid;
-    const messageSid = req.body.MessageSid || req.body.messageSid;
+    lastConversationsWebhook.signatureValid = true;
     const bodyText = req.body.Body || req.body.body || '';
-    const author = req.body.Author || req.body.author || '';
     const shouldEnsure =
       convSid &&
       (event === 'onConversationAdded' || event === 'onMessageAdded');
@@ -613,15 +627,24 @@ app.post(
             if (firebaseMessaging && nativePushTokens.size > 0) {
               await sendNativePushToAll(notifyPayload);
             }
+            lastConversationsWebhook.status = 'processed_push_attempted';
           } catch (pushErr) {
             // Never fail Twilio webhook for push transport issues.
             console.warn('Conversations webhook push notify error:', pushErr?.message || pushErr);
+            lastConversationsWebhook.status = 'processed_push_error';
           }
         }
       } catch (e) {
         console.error('Conversations webhook ensureChatParticipant:', e);
+        lastConversationsWebhook.status = 'handler_error';
+        lastConversationsWebhook.error = e?.message || String(e);
         return res.status(500).send('Error');
       }
+    }
+    if (!shouldEnsure) {
+      lastConversationsWebhook.status = 'ignored_event';
+    } else if (lastConversationsWebhook.status === 'received') {
+      lastConversationsWebhook.status = 'processed_no_push';
     }
     res.status(200).end();
   }
@@ -1203,6 +1226,7 @@ app.get('/api/health', (_req, res) => {
     nativePushLastError,
     nativePushLastResult,
     nativePushLastFailures,
+    lastConversationsWebhook,
   });
 });
 
