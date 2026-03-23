@@ -133,6 +133,47 @@ function fromMatchesOurTwilioNumber(from) {
   return digitsOnly(from) === digitsOnly(twilioPhone);
 }
 
+/** Extra "From" numbers treated as this inbox (Messaging Service pool, secondary long codes). */
+const ourSenderDigitSets = (process.env.TWILIO_SMS_FROM_ALIASES || '')
+  .split(',')
+  .map((s) => digitsOnly(s))
+  .filter(Boolean);
+
+function fromMatchesAnyOurSender(from) {
+  if (fromMatchesOurTwilioNumber(from)) return true;
+  const d = digitsOnly(from);
+  return ourSenderDigitSets.some((x) => x === d);
+}
+
+/**
+ * Use Twilio Message `direction` first (correct for Zapier / Messaging Service).
+ * Falls back to From/To vs TWILIO_PHONE_NUMBER (+ TWILIO_SMS_FROM_ALIASES).
+ */
+function classifyProgrammableSms(sm) {
+  const d = String(sm.direction || '').trim().toLowerCase();
+  const from = rawPhoneFromTwilioAddr(sm.from);
+  const to = rawPhoneFromTwilioAddr(sm.to);
+
+  if (d === 'inbound' && from) {
+    return { kind: 'inbound', customer: from };
+  }
+  if (
+    (d === 'outbound-api' || d === 'outbound-call' || d === 'outbound-reply') &&
+    to
+  ) {
+    return { kind: 'outbound', customer: to };
+  }
+
+  if (fromMatchesAnyOurSender(sm.from) && to) {
+    return { kind: 'outbound', customer: to };
+  }
+  if (fromMatchesOurTwilioNumber(sm.to) && from) {
+    return { kind: 'inbound', customer: from };
+  }
+
+  return { kind: 'unknown', customer: null };
+}
+
 /** Dedupe Programmable Messaging status callbacks (sent + delivered, retries). */
 const mirroredProgrammableMessageSids = new Set();
 const MIRROR_SID_CAP = 8000;
@@ -230,6 +271,7 @@ async function mirrorProgrammableOutboundToConversation(
     attributes: attrs,
   };
   if (dateCreated) params.dateCreated = dateCreated;
+  params.xTwilioWebhookEnabled = 'false';
   await twilioClient.conversations.v1
     .services(serviceSid)
     .conversations(conversationSid)
@@ -254,6 +296,7 @@ async function mirrorProgrammableInboundToConversation(
     attributes: attrs,
   };
   if (dateCreated) params.dateCreated = dateCreated;
+  params.xTwilioWebhookEnabled = 'false';
   await twilioClient.conversations.v1
     .services(serviceSid)
     .conversations(conversationSid)
@@ -269,16 +312,6 @@ function rawPhoneFromTwilioAddr(addr) {
   }
   if (/^[a-z]+:/i.test(s)) return null;
   return s;
-}
-
-/** Other party’s phone for a classic SMS (From/To includes our Twilio number). */
-function customerAddressForProgrammableSms(msg) {
-  const from = rawPhoneFromTwilioAddr(msg.from);
-  const to = rawPhoneFromTwilioAddr(msg.to);
-  if (!from || !to) return null;
-  if (fromMatchesOurTwilioNumber(from)) return to;
-  if (fromMatchesOurTwilioNumber(to)) return from;
-  return null;
 }
 
 async function conversationAlreadyHasMirroredProgrammableSid(conversationSid, smSid) {
@@ -340,6 +373,10 @@ async function pageAllProgrammableMessages(listParams) {
 async function syncProgrammableSmsLogIntoConversations(daysBack) {
   const our = proxyNumberE164();
   const dateSentAfter = new Date(Date.now() - Math.min(Math.max(daysBack, 1), 90) * 86400000);
+  /** Bulk sync of *outbound* log rows can cause Twilio to deliver those rows again on the SMS leg — off by default. */
+  const allowOutboundMirror = ['true', '1', 'yes'].includes(
+    String(process.env.SMS_LOG_SYNC_OUTBOUND_MIRROR || '').toLowerCase()
+  );
 
   const [toUs, fromUs] = await Promise.all([
     pageAllProgrammableMessages({ to: our, dateSentAfter }),
@@ -355,11 +392,12 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
 
   let imported = 0;
   let skipped = 0;
+  let skippedOutboundPolicy = 0;
   const convTouched = new Set();
 
   for (const sm of merged) {
-    const customer = customerAddressForProgrammableSms(sm);
-    if (!customer) {
+    const { kind, customer } = classifyProgrammableSms(sm);
+    if (!customer || kind === 'unknown') {
       skipped++;
       continue;
     }
@@ -378,9 +416,12 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
         continue;
       }
 
-      const outbound = fromMatchesOurTwilioNumber(sm.from);
-
-      if (outbound) {
+      if (kind === 'outbound') {
+        if (!allowOutboundMirror) {
+          skippedOutboundPolicy++;
+          skipped++;
+          continue;
+        }
         const skipWebDup = await recentChatAuthorMessageMatchesBody(
           convSid,
           bodyText,
@@ -422,6 +463,8 @@ async function syncProgrammableSmsLogIntoConversations(daysBack) {
   return {
     imported,
     skipped,
+    skippedOutboundPolicy,
+    outboundMirrorEnabled: allowOutboundMirror,
     scanned: merged.length,
     conversationsTouched: convTouched.size,
   };
@@ -521,7 +564,7 @@ app.post(
 
     const from = req.body.From;
     const to = req.body.To;
-    if (!from || !to || !fromMatchesOurTwilioNumber(from)) {
+    if (!from || !to || !fromMatchesAnyOurSender(from)) {
       return res.status(200).end();
     }
 
