@@ -257,7 +257,12 @@ async function sendNativePushToAll(payload) {
     },
     android: {
       priority: 'high',
-      notification: {},
+      notification: {
+        channelId: 'high_importance_channel',
+        priority: 'high',
+        defaultSound: true,
+        visibility: 'public',
+      },
     },
   };
   const result = await firebaseMessaging.sendEachForMulticast(message);
