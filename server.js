@@ -5,6 +5,8 @@ import twilio from 'twilio';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import webpush from 'web-push';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getMessaging } from 'firebase-admin/messaging';
 import { toE164Australian } from './lib/phone.js';
 import {
   appendTrelloRelayMessages,
@@ -25,6 +27,9 @@ const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
 const pushVapidPublicKey = process.env.PUSH_VAPID_PUBLIC_KEY;
 const pushVapidPrivateKey = process.env.PUSH_VAPID_PRIVATE_KEY;
 const pushVapidSubject = process.env.PUSH_VAPID_SUBJECT || 'mailto:admin@example.com';
+const firebaseProjectId = process.env.FIREBASE_PROJECT_ID;
+const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
 /** E.164 for the number that receives self-SMS Trello relay payloads (default: your Trello SMS number). */
 function trelloRelayE164() {
@@ -95,6 +100,7 @@ requireEnv();
 const twilioClient = twilio(apiKey, apiSecret, { accountSid });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const pushSubscriptions = new Map();
+const nativePushTokens = new Set();
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
 function programmableStatusMirrorEnabled() {
@@ -156,6 +162,29 @@ function webPushEnabled() {
   return Boolean(pushVapidPublicKey && pushVapidPrivateKey);
 }
 
+function nativePushEnabled() {
+  return Boolean(firebaseProjectId && firebaseClientEmail && firebasePrivateKey);
+}
+
+let firebaseMessaging = null;
+if (nativePushEnabled()) {
+  try {
+    if (!getApps().length) {
+      initializeApp({
+        credential: cert({
+          projectId: firebaseProjectId,
+          clientEmail: firebaseClientEmail,
+          privateKey: firebasePrivateKey,
+        }),
+      });
+    }
+    firebaseMessaging = getMessaging();
+  } catch (err) {
+    console.warn('Firebase init error:', err?.message || err);
+    firebaseMessaging = null;
+  }
+}
+
 if (webPushEnabled()) {
   webpush.setVapidDetails(pushVapidSubject, pushVapidPublicKey, pushVapidPrivateKey);
 }
@@ -197,6 +226,48 @@ async function sendWebPushToAll(payload) {
   for (const key of deadKeys) {
     pushSubscriptions.delete(key);
   }
+}
+
+function normalizeNativePushToken(input) {
+  const token = String(input || '').trim();
+  if (!token) return null;
+  if (token.length < 32) return null;
+  return token;
+}
+
+async function sendNativePushToAll(payload) {
+  if (!firebaseMessaging || !nativePushTokens.size) return;
+  const tokens = [...nativePushTokens];
+  const message = {
+    tokens,
+    notification: {
+      title: String(payload?.title || 'New message'),
+      body: String(payload?.body || ''),
+    },
+    data: {
+      url: String(payload?.url || '/'),
+      conversationSid: String(payload?.conversationSid || ''),
+      messageSid: String(payload?.messageSid || ''),
+    },
+    android: {
+      priority: 'high',
+      notification: {
+        channelId: 'default',
+        clickAction: 'FCM_PLUGIN_ACTIVITY',
+      },
+    },
+  };
+  const result = await firebaseMessaging.sendEachForMulticast(message);
+  result.responses.forEach((r, idx) => {
+    if (r.success) return;
+    const code = r.error?.code || '';
+    if (
+      code.includes('registration-token-not-registered') ||
+      code.includes('invalid-registration-token')
+    ) {
+      nativePushTokens.delete(tokens[idx]);
+    }
+  });
 }
 
 function pushPreviewText(raw, maxLen = 140) {
@@ -503,18 +574,24 @@ app.post(
           author &&
           author !== 'system' &&
           author !== twilioChatIdentity &&
-          webPushEnabled() &&
-          pushSubscriptions.size > 0
+          ((webPushEnabled() && pushSubscriptions.size > 0) ||
+            (firebaseMessaging && nativePushTokens.size > 0))
         ) {
           try {
             const preview = pushPreviewText(bodyText) || 'New message received';
-            await sendWebPushToAll({
+            const notifyPayload = {
               title: 'New message',
               body: preview,
               url: '/',
               conversationSid: convSid || null,
               messageSid: messageSid || null,
-            });
+            };
+            if (webPushEnabled() && pushSubscriptions.size > 0) {
+              await sendWebPushToAll(notifyPayload);
+            }
+            if (firebaseMessaging && nativePushTokens.size > 0) {
+              await sendNativePushToAll(notifyPayload);
+            }
           } catch (pushErr) {
             // Never fail Twilio webhook for push transport issues.
             console.warn('Conversations webhook push notify error:', pushErr?.message || pushErr);
@@ -717,6 +794,37 @@ app.post('/api/push/subscribe', (req, res) => {
   }
   pushSubscriptions.set(key, sub);
   return res.json({ ok: true, subscribed: pushSubscriptions.size });
+});
+
+/**
+ * POST /api/push/fcm/subscribe
+ * Header: Authorization: Bearer <sessionJwt>
+ * Body: { token: string }
+ */
+app.post('/api/push/fcm/subscribe', requireSession, (req, res) => {
+  if (!firebaseMessaging) {
+    return res.status(503).json({ error: 'Native push is not configured.' });
+  }
+  const token = normalizeNativePushToken(req.body?.token);
+  if (!token) {
+    return res.status(400).json({ error: 'Invalid FCM token.' });
+  }
+  nativePushTokens.add(token);
+  return res.json({ ok: true, subscribed: nativePushTokens.size });
+});
+
+/**
+ * POST /api/push/fcm/unsubscribe
+ * Header: Authorization: Bearer <sessionJwt>
+ * Body: { token: string }
+ */
+app.post('/api/push/fcm/unsubscribe', requireSession, (req, res) => {
+  const token = normalizeNativePushToken(req.body?.token);
+  if (!token) {
+    return res.status(400).json({ error: 'Invalid FCM token.' });
+  }
+  nativePushTokens.delete(token);
+  return res.json({ ok: true, subscribed: nativePushTokens.size });
 });
 
 /**
@@ -1021,6 +1129,7 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     service: 'pbsg-messenger-backend',
     programmableStatusCallbackMirror: programmableStatusMirrorEnabled(),
+    nativePushConfigured: Boolean(firebaseMessaging),
   });
 });
 
