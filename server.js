@@ -634,8 +634,7 @@ async function listConversationSidsForIdentity() {
     if (!page.nextPageUrl) break;
     page = await page.nextPage();
   }
-  const unique = [...new Set(sids)];
-  if (unique.length) return unique;
+  const known = new Set(sids);
 
   /**
    * Fallback for service-created threads that exist but missed the post-event webhook:
@@ -649,8 +648,13 @@ async function listConversationSidsForIdentity() {
     for (const conv of convPage.instances) {
       const sid = conv.sid;
       if (!sid) continue;
+      if (known.has(sid)) {
+        recovered.push(sid);
+        continue;
+      }
       try {
         await ensureChatParticipantInConversation(sid);
+        known.add(sid);
         recovered.push(sid);
       } catch (e) {
         console.warn('listConversationSidsForIdentity fallback', sid, e?.message);
