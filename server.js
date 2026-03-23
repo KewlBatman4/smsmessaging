@@ -595,54 +595,61 @@ app.post(
     if (shouldEnsure) {
       try {
         await ensureChatParticipantInConversation(convSid);
-        // Display-only helper: if inbound message embeds [[PBSG_INTERNAL_DRAFT]], add a synthetic
-        // pbsgOutbound row so the draft text appears as a right-aligned "sent" bubble in the app.
-        if (event === 'onMessageAdded' && author !== 'system') {
+      } catch (e) {
+        // Do not block push delivery if participant-linking has a transient failure.
+        console.error('Conversations webhook ensureChatParticipant:', e);
+        lastConversationsWebhook.status = 'ensure_error';
+        lastConversationsWebhook.error = e?.message || String(e);
+      }
+      // Display-only helper: if inbound message embeds [[PBSG_INTERNAL_DRAFT]], add a synthetic
+      // pbsgOutbound row so the draft text appears as a right-aligned "sent" bubble in the app.
+      if (event === 'onMessageAdded' && author !== 'system') {
+        try {
           const draftBody = extractInternalDraftSegment(bodyText);
           if (draftBody) {
             await ensureInternalDraftMirrorMessage(convSid, messageSid, draftBody);
           }
+        } catch (draftErr) {
+          console.warn(
+            'Conversations webhook draft mirror error:',
+            draftErr?.message || draftErr
+          );
         }
-        // Phone push notification for new inbound customer messages.
-        // Skip system/web-app-authored messages to avoid notifying on our own sends.
-        const hasPushTargets =
-          (webPushEnabled() && pushSubscriptions.size > 0) ||
-          (firebaseMessaging && nativePushTokens.size > 0);
-        const isInboundMessageEvent =
-          event === 'onMessageAdded' &&
-          author !== 'system' &&
-          author !== twilioChatIdentity;
-        const isConversationAddedEvent = event === 'onConversationAdded';
-        if (hasPushTargets && (isInboundMessageEvent || isConversationAddedEvent)) {
-          try {
-            const preview = isConversationAddedEvent
-              ? 'New conversation started'
-              : pushPreviewText(bodyText) || 'New message received';
-            const notifyPayload = {
-              title: 'New message',
-              body: preview,
-              url: '/',
-              conversationSid: convSid || null,
-              messageSid: messageSid || null,
-            };
-            if (webPushEnabled() && pushSubscriptions.size > 0) {
-              await sendWebPushToAll(notifyPayload);
-            }
-            if (firebaseMessaging && nativePushTokens.size > 0) {
-              await sendNativePushToAll(notifyPayload);
-            }
-            lastConversationsWebhook.status = 'processed_push_attempted';
-          } catch (pushErr) {
-            // Never fail Twilio webhook for push transport issues.
-            console.warn('Conversations webhook push notify error:', pushErr?.message || pushErr);
-            lastConversationsWebhook.status = 'processed_push_error';
+      }
+      // Phone push notification for new inbound customer messages.
+      // Skip system/web-app-authored messages to avoid notifying on our own sends.
+      const hasPushTargets =
+        (webPushEnabled() && pushSubscriptions.size > 0) ||
+        (firebaseMessaging && nativePushTokens.size > 0);
+      const isInboundMessageEvent =
+        event === 'onMessageAdded' &&
+        author !== 'system' &&
+        author !== twilioChatIdentity;
+      const isConversationAddedEvent = event === 'onConversationAdded';
+      if (hasPushTargets && (isInboundMessageEvent || isConversationAddedEvent)) {
+        try {
+          const preview = isConversationAddedEvent
+            ? 'New conversation started'
+            : pushPreviewText(bodyText) || 'New message received';
+          const notifyPayload = {
+            title: 'New message',
+            body: preview,
+            url: '/',
+            conversationSid: convSid || null,
+            messageSid: messageSid || null,
+          };
+          if (webPushEnabled() && pushSubscriptions.size > 0) {
+            await sendWebPushToAll(notifyPayload);
           }
+          if (firebaseMessaging && nativePushTokens.size > 0) {
+            await sendNativePushToAll(notifyPayload);
+          }
+          lastConversationsWebhook.status = 'processed_push_attempted';
+        } catch (pushErr) {
+          // Never fail Twilio webhook for push transport issues.
+          console.warn('Conversations webhook push notify error:', pushErr?.message || pushErr);
+          lastConversationsWebhook.status = 'processed_push_error';
         }
-      } catch (e) {
-        console.error('Conversations webhook ensureChatParticipant:', e);
-        lastConversationsWebhook.status = 'handler_error';
-        lastConversationsWebhook.error = e?.message || String(e);
-        return res.status(500).send('Error');
       }
     }
     if (!shouldEnsure) {
