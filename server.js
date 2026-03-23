@@ -251,10 +251,7 @@ async function sendNativePushToAll(payload) {
     },
     android: {
       priority: 'high',
-      notification: {
-        channelId: 'default',
-        clickAction: 'FCM_PLUGIN_ACTIVITY',
-      },
+      notification: {},
     },
   };
   const result = await firebaseMessaging.sendEachForMulticast(message);
@@ -828,6 +825,18 @@ app.post('/api/push/fcm/unsubscribe', requireSession, (req, res) => {
 });
 
 /**
+ * GET /api/push/fcm/status
+ * Header: Authorization: Bearer <sessionJwt>
+ */
+app.get('/api/push/fcm/status', requireSession, (_req, res) => {
+  return res.json({
+    ok: true,
+    configured: Boolean(firebaseMessaging),
+    subscribed: nativePushTokens.size,
+  });
+});
+
+/**
  * POST /api/push/unsubscribe
  * Body: { endpoint: string }
  */
@@ -1130,6 +1139,7 @@ app.get('/api/health', (_req, res) => {
     service: 'pbsg-messenger-backend',
     programmableStatusCallbackMirror: programmableStatusMirrorEnabled(),
     nativePushConfigured: Boolean(firebaseMessaging),
+    nativePushSubscriptions: nativePushTokens.size,
   });
 });
 
