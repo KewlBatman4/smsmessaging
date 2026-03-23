@@ -42,7 +42,7 @@ function trelloRelaySourceE164() {
 
 const sessionJwtSecret = process.env.SESSION_JWT_SECRET;
 const appPasswordHash = process.env.APP_PASSWORD_HASH;
-const sessionMaxAgeSec = Number(process.env.SESSION_MAX_AGE_SECONDS) || 604800; // 7 days
+const sessionMaxAgeSec = Number(process.env.SESSION_MAX_AGE_SECONDS) || 31536000; // 365 days
 /** Single Twilio chat identity for this inbox (alphanumeric + underscore/hyphen). */
 const twilioChatIdentity = (process.env.TWILIO_CONVERSATIONS_IDENTITY || 'pbsg-inbox').trim();
 
