@@ -148,14 +148,58 @@ function programmableStatusMirrorEnabled() {
   );
 }
 
+/**
+ * Capacitor / Cordova WebViews load the UI from a non-real host (e.g. https://localhost).
+ * If CORS_ORIGIN is a fixed list of web origins only, the Android APK gets "Failed to fetch"
+ * on login. Allow these by default when an allowlist is set; set CORS_ALLOW_CAPACITOR=false to disable.
+ */
+function isPackagedMessengerOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return false;
+  try {
+    const u = new URL(origin);
+    const h = u.hostname.toLowerCase();
+    if (h !== 'localhost' && h !== '127.0.0.1') return false;
+    const p = u.protocol.toLowerCase();
+    return (
+      p === 'https:' ||
+      p === 'http:' ||
+      p === 'capacitor:' ||
+      p === 'ionic:'
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Browser Origin never has a trailing slash; strip so CORS matches Netlify exactly. */
 function corsOriginOption() {
   const raw = process.env.CORS_ORIGIN;
   if (!raw?.trim()) return true;
-  return raw
+  const list = raw
     .split(',')
     .map((s) => s.trim().replace(/\/+$/, ''))
     .filter(Boolean);
+  const allowPackaged = !['false', '0', 'no', 'off'].includes(
+    String(process.env.CORS_ALLOW_CAPACITOR ?? 'true').toLowerCase()
+  );
+  if (!allowPackaged) return list;
+
+  return (origin, cb) => {
+    if (!origin) {
+      cb(null, true);
+      return;
+    }
+    const normalized = origin.replace(/\/+$/, '');
+    if (list.includes(normalized)) {
+      cb(null, true);
+      return;
+    }
+    if (isPackagedMessengerOrigin(origin)) {
+      cb(null, true);
+      return;
+    }
+    cb(null, false);
+  };
 }
 
 /**
