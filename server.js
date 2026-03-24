@@ -14,6 +14,11 @@ import {
   listTrelloRelayThreads,
   parseTrelloRelaySmsBody,
 } from './lib/trelloRelay.js';
+import {
+  readAllContactLabels,
+  removeContactLabel,
+  upsertContactLabel,
+} from './lib/contactLabels.js';
 
 const { AccessToken } = twilio.jwt;
 const { ChatGrant } = AccessToken;
@@ -1201,6 +1206,63 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   } catch (err) {
     console.error('List conversations error:', err);
     return res.status(500).json({ error: 'Failed to list conversations.' });
+  }
+});
+
+/**
+ * GET /api/contact-labels
+ * Display names + details per conversation SID (does not change Twilio friendlyName).
+ */
+app.get('/api/contact-labels', requireSession, (_req, res) => {
+  try {
+    return res.json({ labels: readAllContactLabels() });
+  } catch (err) {
+    console.error('Contact labels read error:', err);
+    return res.status(500).json({ error: 'Failed to load contact labels.' });
+  }
+});
+
+/**
+ * PUT /api/contact-labels
+ * Body: { conversationSid, name?, details? } — empty name and details removes the label row.
+ */
+app.put('/api/contact-labels', requireSession, (req, res) => {
+  const conversationSid = req.body?.conversationSid;
+  if (!conversationSid || typeof conversationSid !== 'string') {
+    return res.status(400).json({ error: 'conversationSid is required.' });
+  }
+  try {
+    const label = upsertContactLabel(conversationSid, {
+      name: req.body?.name,
+      details: req.body?.details,
+    });
+    return res.json({ ok: true, label });
+  } catch (err) {
+    console.error('Contact labels write error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to save contact label.' });
+  }
+});
+
+/**
+ * DELETE /api/twilio-conversations/:sid
+ * Removes the conversation from Twilio Conversations (and local label for that SID).
+ */
+app.delete('/api/twilio-conversations/:sid', requireSession, async (req, res) => {
+  const sid = String(req.params.sid || '').trim();
+  if (!sid) {
+    return res.status(400).json({ error: 'Conversation SID is required.' });
+  }
+  try {
+    await twilioClient.conversations.v1
+      .services(serviceSid)
+      .conversations(sid)
+      .remove();
+    removeContactLabel(sid);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Delete Twilio conversation error:', err);
+    const msg = err?.message || 'Failed to delete conversation.';
+    return res.status(500).json({ error: msg });
   }
 });
 
