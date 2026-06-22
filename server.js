@@ -116,6 +116,10 @@ const recentConversationsWebhooks = [];
 const seenConversationSids = new Set();
 const newConversationNotifiedAt = new Map();
 const NEW_CONVERSATION_COOLDOWN_MS = 45 * 1000;
+// Caps so these long-lived structures stay bounded on the single instance.
+const SEEN_CONVERSATION_CAP = 20000;
+const NEW_CONVERSATION_NOTIFIED_CAP = 20000;
+const PUSH_SUBSCRIPTION_CAP = 2000;
 
 function recordConversationsWebhookSnapshot(snapshot) {
   recentConversationsWebhooks.unshift({
@@ -132,13 +136,21 @@ function recordConversationsWebhookSnapshot(snapshot) {
   }
 }
 
-function shouldNotifyNewConversation(conversationSid) {
+/** Read-only: may a "new conversation" push be sent now (outside the cooldown)? */
+function canNotifyNewConversation(conversationSid) {
   if (!conversationSid) return false;
-  const now = Date.now();
   const lastAt = newConversationNotifiedAt.get(conversationSid) || 0;
-  if (now - lastAt < NEW_CONVERSATION_COOLDOWN_MS) return false;
-  newConversationNotifiedAt.set(conversationSid, now);
-  return true;
+  return Date.now() - lastAt >= NEW_CONVERSATION_COOLDOWN_MS;
+}
+
+/** Record that a "new conversation" push was actually sent (starts the cooldown). */
+function markNewConversationNotified(conversationSid) {
+  if (!conversationSid) return;
+  newConversationNotifiedAt.set(conversationSid, Date.now());
+  if (newConversationNotifiedAt.size > NEW_CONVERSATION_NOTIFIED_CAP) {
+    const oldest = newConversationNotifiedAt.keys().next().value;
+    newConversationNotifiedAt.delete(oldest);
+  }
 }
 
 /** Status-callback → Conversations mirror is opt-in (default off) so misconfigured relay cannot resend SMS. */
@@ -460,28 +472,38 @@ function listOurSmsE164sForClient() {
   return [...out];
 }
 
+/** Add to a Set with FIFO eviction so dedup memory degrades gracefully at the
+ *  cap instead of being wiped wholesale (a full clear would re-admit — and so
+ *  re-notify/re-mirror — every recently-seen SID at once). */
+function addToCappedSet(set, key, cap) {
+  set.add(key);
+  if (set.size > cap) {
+    const oldest = set.values().next().value;
+    set.delete(oldest);
+  }
+}
+
 /** Dedupe Programmable Messaging status callbacks (sent + delivered, retries). */
 const mirroredProgrammableMessageSids = new Set();
 const MIRROR_SID_CAP = 8000;
 function rememberMirroredSid(sid) {
-  mirroredProgrammableMessageSids.add(sid);
-  if (mirroredProgrammableMessageSids.size > MIRROR_SID_CAP) {
-    mirroredProgrammableMessageSids.clear();
-  }
+  addToCappedSet(mirroredProgrammableMessageSids, sid, MIRROR_SID_CAP);
 }
 
 /** Dedupe push sends per message SID (avoids double notify across webhook paths). */
 const pushedMessageSids = new Set();
 const PUSH_SID_CAP = 8000;
-function shouldSendPushForMessageSid(sid) {
+/** Read-only: has a push already been sent for this message SID? */
+function wasPushedForMessageSid(sid) {
   const key = String(sid || '').trim();
-  if (!key) return true;
-  if (pushedMessageSids.has(key)) return false;
-  pushedMessageSids.add(key);
-  if (pushedMessageSids.size > PUSH_SID_CAP) {
-    pushedMessageSids.clear();
-  }
-  return true;
+  if (!key) return false;
+  return pushedMessageSids.has(key);
+}
+/** Mark a message SID as pushed — call ONLY when a push is actually being sent. */
+function markPushedForMessageSid(sid) {
+  const key = String(sid || '').trim();
+  if (!key) return;
+  addToCappedSet(pushedMessageSids, key, PUSH_SID_CAP);
 }
 
 async function listParticipantConversationRowsForAddress(address) {
@@ -733,19 +755,24 @@ app.post(
         event === 'onMessageAdded' && convSid && !seenConversationSids.has(convSid);
       const shouldSendNewConversationPush =
         convSid &&
-        shouldNotifyNewConversation(convSid) &&
+        canNotifyNewConversation(convSid) &&
         (isConversationAddedEvent || isFirstSeenConversationMessage);
-      const shouldSendByMessageSid = shouldSendPushForMessageSid(messageSid);
+      const notAlreadyPushed = !wasPushedForMessageSid(messageSid);
       if (convSid) {
-        seenConversationSids.add(convSid);
+        addToCappedSet(seenConversationSids, convSid, SEEN_CONVERSATION_CAP);
       }
       const shouldSendInboundMessagePush =
         isInboundMessageEvent && !shouldSendNewConversationPush;
       if (
         hasPushTargets &&
-        shouldSendByMessageSid &&
+        notAlreadyPushed &&
         (shouldSendNewConversationPush || shouldSendInboundMessagePush)
       ) {
+        // Commit the dedup SID and new-conversation cooldown only now that we
+        // are actually sending — a webhook that decides NOT to push must not
+        // suppress a later Twilio retry or the Studio fallback for this message.
+        markPushedForMessageSid(messageSid);
+        if (shouldSendNewConversationPush) markNewConversationNotified(convSid);
         try {
           const preview = shouldSendNewConversationPush
             ? 'New conversation started'
@@ -970,6 +997,12 @@ app.post('/api/push/subscribe', (req, res) => {
     return res.status(400).json({ error: 'Invalid push subscription.' });
   }
   pushSubscriptions.set(key, sub);
+  if (pushSubscriptions.size > PUSH_SUBSCRIPTION_CAP) {
+    // FIFO-evict the oldest subscription so this unauthenticated endpoint
+    // cannot grow the Map without bound.
+    const oldest = pushSubscriptions.keys().next().value;
+    if (oldest !== key) pushSubscriptions.delete(oldest);
+  }
   return res.json({ ok: true, subscribed: pushSubscriptions.size });
 });
 
@@ -1535,7 +1568,7 @@ app.post('/api/push/studio-inbound', async (req, res) => {
     );
     const author = String(req.body?.author || req.body?.Author || '');
     const bodyText = String(req.body?.body || req.body?.Body || '');
-    if (!shouldSendPushForMessageSid(messageSid)) {
+    if (wasPushedForMessageSid(messageSid)) {
       return res.json({ ok: true, deduped: true });
     }
     if (
@@ -1551,6 +1584,9 @@ app.post('/api/push/studio-inbound', async (req, res) => {
     if (!hasPushTargets) {
       return res.json({ ok: true, skipped: 'no_subscribers' });
     }
+    // Commit the dedup SID only now that we will actually send, so a skipped
+    // call (self/system author, or no subscribers) does not suppress a later one.
+    markPushedForMessageSid(messageSid);
     const preview = pushPreviewText(bodyText) || 'New conversation started';
     const notifyPayload = {
       title: 'New message',
