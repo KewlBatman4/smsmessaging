@@ -1267,31 +1267,30 @@ app.post('/api/token', requireSession, (_req, res) => {
  * Body: { to: string (phone) }
  */
 /**
- * List every Conversation SID where this service's chat identity is a participant.
- * Used so the REST client can open the same threads the Conversations SDK subscribes to.
+ * Load the inbox's conversations as lightweight rows in a single pass.
+ * 1. Page participantConversations to learn which threads we already belong to.
+ * 2. Page conversations ONCE — recovering (joining) any thread that missed the
+ *    post-event webhook, and capturing friendlyName/dateUpdated from the same
+ *    page so the collapse step needs no per-SID .fetch() (was an N+1 per request).
+ * @returns {Array<{ sid: string, friendlyName: string|null, dateUpdated: number }>}
  */
-async function listConversationSidsForIdentity() {
-  const sids = [];
-  let page = await twilioClient.conversations.v1
+async function listInboxConversations() {
+  const known = new Set();
+  let pcPage = await twilioClient.conversations.v1
     .services(serviceSid)
     .participantConversations.page({
       identity: twilioChatIdentity,
       pageSize: 100,
     });
   for (;;) {
-    for (const row of page.instances) {
-      if (row.conversationSid) sids.push(row.conversationSid);
+    for (const row of pcPage.instances) {
+      if (row.conversationSid) known.add(row.conversationSid);
     }
-    if (!page.nextPageUrl) break;
-    page = await page.nextPage();
+    if (!pcPage.nextPageUrl) break;
+    pcPage = await pcPage.nextPage();
   }
-  const known = new Set(sids);
 
-  /**
-   * Fallback for service-created threads that exist but missed the post-event webhook:
-   * attach the web inbox identity and return those SIDs so the UI can open them now.
-   */
-  const recovered = [];
+  const rows = [];
   let convPage = await twilioClient.conversations.v1
     .services(serviceSid)
     .conversations.page({ pageSize: 50 });
@@ -1299,22 +1298,27 @@ async function listConversationSidsForIdentity() {
     for (const conv of convPage.instances) {
       const sid = conv.sid;
       if (!sid) continue;
-      if (known.has(sid)) {
-        recovered.push(sid);
-        continue;
+      if (!known.has(sid)) {
+        // Recover a service-created thread that missed the post-event webhook:
+        // attach the web inbox identity so the UI can open it now.
+        try {
+          await ensureChatParticipantInConversation(sid);
+          known.add(sid);
+        } catch (e) {
+          console.warn('inbox conversation recovery failed', sid, e?.message);
+          continue; // not joined -> the inbox can't subscribe; skip it
+        }
       }
-      try {
-        await ensureChatParticipantInConversation(sid);
-        known.add(sid);
-        recovered.push(sid);
-      } catch (e) {
-        console.warn('listConversationSidsForIdentity fallback', sid, e?.message);
-      }
+      rows.push({
+        sid,
+        friendlyName: conv.friendlyName,
+        dateUpdated: conv.dateUpdated?.getTime?.() ?? 0,
+      });
     }
     if (!convPage.nextPageUrl) break;
     convPage = await convPage.nextPage();
   }
-  return [...new Set(recovered)];
+  return rows;
 }
 
 /**
@@ -1331,29 +1335,17 @@ function conversationThreadKey(friendlyName, sid) {
   return `name:${raw.toLowerCase()}`;
 }
 
-async function collapseConversationSidsByThread(conversationSids) {
-  if (!conversationSids.length) return [];
+function collapseConversations(rows) {
   const byKey = new Map();
-  for (const sid of conversationSids) {
-    try {
-      const conv = await twilioClient.conversations.v1
-        .services(serviceSid)
-        .conversations(sid)
-        .fetch();
-      const key = conversationThreadKey(conv.friendlyName, sid);
-      const updated = conv.dateUpdated?.getTime?.() ?? 0;
-      const prev = byKey.get(key);
-      if (!prev || updated >= prev.updated) {
-        byKey.set(key, { sid, updated });
-      }
-    } catch (e) {
-      const key = `sid:${sid}`;
-      if (!byKey.has(key)) byKey.set(key, { sid, updated: 0 });
-      console.warn('collapseConversationSidsByThread', sid, e?.message);
+  for (const row of rows) {
+    const key = conversationThreadKey(row.friendlyName, row.sid);
+    const prev = byKey.get(key);
+    if (!prev || row.dateUpdated >= prev.dateUpdated) {
+      byKey.set(key, row);
     }
   }
   return [...byKey.values()]
-    .sort((a, b) => b.updated - a.updated)
+    .sort((a, b) => b.dateUpdated - a.dateUpdated)
     .map((x) => x.sid);
 }
 
@@ -1363,8 +1355,8 @@ async function collapseConversationSidsByThread(conversationSids) {
  */
 app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   try {
-    const rawConversationSids = await listConversationSidsForIdentity();
-    const conversationSids = await collapseConversationSidsByThread(rawConversationSids);
+    const rows = await listInboxConversations();
+    const conversationSids = collapseConversations(rows);
     return res.json({ conversationSids });
   } catch (err) {
     console.error('List conversations error:', err);
