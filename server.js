@@ -1085,21 +1085,69 @@ app.post('/api/push/test', requireSession, async (req, res) => {
 });
 
 /**
+ * Brute-force / DoS guard for the single-shared-password /api/login.
+ * Counts FAILED attempts per client IP within a rolling window; a correct
+ * password clears the counter, so legitimate staff are never locked out by
+ * their own successful logins. Blocked requests return before bcrypt runs,
+ * so this also caps the event-loop cost of password hashing under flood.
+ */
+const LOGIN_RL_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RL_MAX_FAILS = 30;
+const LOGIN_RL_CAP = 5000;
+const loginFailures = new Map(); // ip -> { count, resetAt }
+
+function loginRateLimitRetryAfter(ip) {
+  const now = Date.now();
+  const rec = loginFailures.get(ip);
+  if (!rec || now >= rec.resetAt) return 0;
+  if (rec.count >= LOGIN_RL_MAX_FAILS) {
+    return Math.max(1, Math.ceil((rec.resetAt - now) / 1000));
+  }
+  return 0;
+}
+
+function recordLoginFailure(ip) {
+  const now = Date.now();
+  const rec = loginFailures.get(ip);
+  if (!rec || now >= rec.resetAt) {
+    loginFailures.set(ip, { count: 1, resetAt: now + LOGIN_RL_WINDOW_MS });
+  } else {
+    rec.count += 1;
+  }
+  // Bound memory: prune expired entries, then hard-cap.
+  if (loginFailures.size > LOGIN_RL_CAP) {
+    for (const [k, v] of loginFailures) {
+      if (now >= v.resetAt) loginFailures.delete(k);
+    }
+    if (loginFailures.size > LOGIN_RL_CAP) loginFailures.clear();
+  }
+}
+
+/**
  * POST /api/login
  * Body: { password: string }
  * Returns a signed session JWT (store in browser; use as Bearer for /api/token and /api/conversations).
  */
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  const retryAfter = loginRateLimitRetryAfter(ip);
+  if (retryAfter > 0) {
+    res.set('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: 'Too many sign-in attempts. Please try again later.' });
+  }
+
   const password = req.body?.password;
   if (!password || typeof password !== 'string') {
     return res.status(400).json({ error: 'Password is required.' });
   }
 
   try {
-    const ok = bcrypt.compareSync(password, appPasswordHash);
+    const ok = await bcrypt.compare(password, appPasswordHash);
     if (!ok) {
+      recordLoginFailure(ip);
       return res.status(401).json({ error: 'Invalid credentials.' });
     }
+    loginFailures.delete(ip);
     const sessionToken = jwt.sign(
       { v: 1 },
       sessionJwtSecret,
