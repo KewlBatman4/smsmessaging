@@ -19,6 +19,7 @@ import {
   removeContactLabel,
   upsertContactLabel,
 } from './lib/contactLabels.js';
+import { readSettings, updateSettings } from './lib/appSettings.js';
 
 const { AccessToken } = twilio.jwt;
 const { ChatGrant } = AccessToken;
@@ -1394,6 +1395,33 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   } catch (err) {
     console.error('List conversations error:', err);
     return res.status(500).json({ error: 'Failed to list conversations.' });
+  }
+});
+
+/**
+ * GET /api/settings
+ * Shared, server-side UI settings (apply to every browser/session).
+ */
+app.get('/api/settings', requireSession, (_req, res) => {
+  try {
+    return res.json({ settings: readSettings() });
+  } catch (err) {
+    console.error('Settings read error:', err);
+    return res.status(500).json({ error: 'Failed to load settings.' });
+  }
+});
+
+/**
+ * PUT /api/settings
+ * Body: { hideRecruitment?: boolean }
+ */
+app.put('/api/settings', requireSession, (req, res) => {
+  try {
+    const settings = updateSettings({ hideRecruitment: req.body?.hideRecruitment });
+    return res.json({ ok: true, settings });
+  } catch (err) {
+    console.error('Settings write error:', err);
+    return res.status(500).json({ error: 'Failed to save settings.' });
   }
 });
 
