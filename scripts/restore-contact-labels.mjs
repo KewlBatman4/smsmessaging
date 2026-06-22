@@ -17,22 +17,37 @@ if (!secret) {
   console.error('SESSION_JWT_SECRET is required (run from the backend folder with its .env).');
   process.exit(1);
 }
-const labels = JSON.parse(fs.readFileSync(inPath, 'utf8'));
+let labels;
+try {
+  labels = JSON.parse(fs.readFileSync(inPath, 'utf8'));
+} catch (e) {
+  console.error('Cannot read/parse', inPath, '-', e.message);
+  process.exit(2);
+}
+if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
+  console.error('Backup must be a JSON object of { conversationSid: { name, details } }.');
+  process.exit(2);
+}
 const token = jwt.sign({ sub: 'labels-restore' }, secret, { expiresIn: '30m' });
 
 let ok = 0;
 let fail = 0;
 for (const [conversationSid, v] of Object.entries(labels)) {
-  const res = await fetch(`${base}/api/contact-labels`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ conversationSid, name: v.name, details: v.details }),
-  });
-  if (res.ok) {
-    ok++;
-  } else {
+  try {
+    const res = await fetch(`${base}/api/contact-labels`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ conversationSid, name: v?.name, details: v?.details }),
+    });
+    if (res.ok) {
+      ok++;
+    } else {
+      fail++;
+      console.error('FAILED', conversationSid, res.status, (await res.text()).slice(0, 120));
+    }
+  } catch (e) {
     fail++;
-    console.error('FAILED', conversationSid, res.status, (await res.text()).slice(0, 120));
+    console.error('FAILED', conversationSid, '-', e.message);
   }
 }
 console.log(`Restored ${ok} label(s), ${fail} failed, into ${base}`);

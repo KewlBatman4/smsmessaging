@@ -20,15 +20,27 @@ if (!secret) {
 }
 
 const token = jwt.sign({ sub: 'labels-backup' }, secret, { expiresIn: '10m' });
-const res = await fetch(`${base}/api/contact-labels`, {
-  headers: { Authorization: `Bearer ${token}` },
-});
+let res;
+try {
+  res = await fetch(`${base}/api/contact-labels`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+} catch (e) {
+  console.error('Request failed:', e.message);
+  process.exit(2);
+}
 console.log('GET', `${base}/api/contact-labels`, '->', res.status);
 const text = await res.text();
 if (!res.ok) {
   console.error('Failed:', text.slice(0, 300));
   process.exit(2);
 }
-const labels = JSON.parse(text).labels || {};
+let labels;
+try {
+  labels = JSON.parse(text).labels || {};
+} catch (e) {
+  console.error('Server returned non-JSON:', text.slice(0, 200));
+  process.exit(2);
+}
 fs.writeFileSync(out, JSON.stringify(labels, null, 2), 'utf8');
 console.log(`Saved ${Object.keys(labels).length} contact label(s) to ${out}`);
