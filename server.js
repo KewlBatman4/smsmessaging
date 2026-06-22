@@ -976,7 +976,7 @@ app.post('/api/push/subscribe', (req, res) => {
  * Header: Authorization: Bearer <sessionJwt>
  * Body: { token: string }
  */
-app.post('/api/push/fcm/subscribe', (req, res) => {
+app.post('/api/push/fcm/subscribe', requireSession, (req, res) => {
   if (!firebaseMessaging) {
     return res.status(503).json({ error: 'Native push is not configured.' });
   }
@@ -993,7 +993,7 @@ app.post('/api/push/fcm/subscribe', (req, res) => {
  * Header: Authorization: Bearer <sessionJwt>
  * Body: { token: string }
  */
-app.post('/api/push/fcm/unsubscribe', (req, res) => {
+app.post('/api/push/fcm/unsubscribe', requireSession, (req, res) => {
   const token = normalizeNativePushToken(req.body?.token);
   if (!token) {
     return res.status(400).json({ error: 'Invalid FCM token.' });
@@ -1023,7 +1023,7 @@ app.get('/api/push/fcm/status', requireSession, (_req, res) => {
  * POST /api/push/fcm/test
  * Body: { title?: string, body?: string, url?: string }
  */
-app.post('/api/push/fcm/test', async (req, res) => {
+app.post('/api/push/fcm/test', requireSession, async (req, res) => {
   if (!firebaseMessaging) {
     return res.status(503).json({ error: 'Native push is not configured.' });
   }
