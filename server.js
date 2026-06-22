@@ -304,6 +304,7 @@ function normalizePushSubscription(input) {
 
 async function sendWebPushToAll(payload) {
   const deadKeys = [];
+  let firstError = null;
   const sends = [];
   for (const [key, sub] of pushSubscriptions.entries()) {
     sends.push(
@@ -313,7 +314,10 @@ async function sendWebPushToAll(payload) {
           deadKeys.push(key);
           return;
         }
-        throw err;
+        // Don't rethrow here: a rethrow rejects Promise.all and skips the
+        // dead-subscription cleanup below, so 404/410 endpoints would be
+        // retried forever. Remember one error and surface it after cleanup.
+        if (!firstError) firstError = err;
       })
     );
   }
@@ -321,6 +325,7 @@ async function sendWebPushToAll(payload) {
   for (const key of deadKeys) {
     pushSubscriptions.delete(key);
   }
+  if (firstError) throw firstError;
 }
 
 function normalizeNativePushToken(input) {
