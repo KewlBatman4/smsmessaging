@@ -1267,15 +1267,14 @@ app.post('/api/token', requireSession, (_req, res) => {
  * Body: { to: string (phone) }
  */
 /**
- * Load the inbox's conversations as lightweight rows in a single pass.
- * 1. Page participantConversations to learn which threads we already belong to.
- * 2. Page conversations ONCE — recovering (joining) any thread that missed the
- *    post-event webhook, and capturing friendlyName/dateUpdated from the same
- *    page so the collapse step needs no per-SID .fetch() (was an N+1 per request).
+ * Fast inbox list: read straight from participantConversations, which already
+ * includes friendlyName + dateUpdated for every thread the inbox identity is in.
+ * No full-conversation scan, no per-SID fetch, no writes on the hot path — this
+ * is what the "Connecting to inbox…" screen waits on, so keep it cheap.
  * @returns {Array<{ sid: string, friendlyName: string|null, dateUpdated: number }>}
  */
 async function listInboxConversations() {
-  const known = new Set();
+  const rows = [];
   let pcPage = await twilioClient.conversations.v1
     .services(serviceSid)
     .participantConversations.page({
@@ -1284,41 +1283,72 @@ async function listInboxConversations() {
     });
   for (;;) {
     for (const row of pcPage.instances) {
-      if (row.conversationSid) known.add(row.conversationSid);
+      if (!row.conversationSid) continue;
+      rows.push({
+        sid: row.conversationSid,
+        friendlyName: row.conversationFriendlyName,
+        dateUpdated: row.conversationDateUpdated?.getTime?.() ?? 0,
+      });
     }
     if (!pcPage.nextPageUrl) break;
     pcPage = await pcPage.nextPage();
   }
+  return rows;
+}
 
-  const rows = [];
-  let convPage = await twilioClient.conversations.v1
-    .services(serviceSid)
-    .conversations.page({ pageSize: 50 });
-  for (;;) {
-    for (const conv of convPage.instances) {
-      const sid = conv.sid;
-      if (!sid) continue;
-      if (!known.has(sid)) {
-        // Recover a service-created thread that missed the post-event webhook:
-        // attach the web inbox identity so the UI can open it now.
+/**
+ * Recovery for service-created threads that never got the inbox identity added
+ * (e.g. created before the post-event webhook existed). This is the slow
+ * full-conversation scan + ensureChatParticipant; run it in the BACKGROUND on a
+ * throttle so it never blocks GET /api/conversation-sids. Newly-joined threads
+ * then appear on the next inbox load (participantConversations returns them).
+ */
+let recoveryInFlight = false;
+let lastRecoveryAt = 0;
+const RECOVERY_THROTTLE_MS = 5 * 60 * 1000;
+
+function maybeRunBackgroundRecovery() {
+  const now = Date.now();
+  if (recoveryInFlight || now - lastRecoveryAt < RECOVERY_THROTTLE_MS) return;
+  recoveryInFlight = true;
+  lastRecoveryAt = now;
+  (async () => {
+    const known = new Set();
+    let pcPage = await twilioClient.conversations.v1
+      .services(serviceSid)
+      .participantConversations.page({ identity: twilioChatIdentity, pageSize: 100 });
+    for (;;) {
+      for (const row of pcPage.instances) {
+        if (row.conversationSid) known.add(row.conversationSid);
+      }
+      if (!pcPage.nextPageUrl) break;
+      pcPage = await pcPage.nextPage();
+    }
+    let convPage = await twilioClient.conversations.v1
+      .services(serviceSid)
+      .conversations.page({ pageSize: 50 });
+    let joined = 0;
+    for (;;) {
+      for (const conv of convPage.instances) {
+        const sid = conv.sid;
+        if (!sid || known.has(sid)) continue;
         try {
           await ensureChatParticipantInConversation(sid);
           known.add(sid);
+          joined++;
         } catch (e) {
-          console.warn('inbox conversation recovery failed', sid, e?.message);
-          continue; // not joined -> the inbox can't subscribe; skip it
+          console.warn('background recovery join failed', sid, e?.message);
         }
       }
-      rows.push({
-        sid,
-        friendlyName: conv.friendlyName,
-        dateUpdated: conv.dateUpdated?.getTime?.() ?? 0,
-      });
+      if (!convPage.nextPageUrl) break;
+      convPage = await convPage.nextPage();
     }
-    if (!convPage.nextPageUrl) break;
-    convPage = await convPage.nextPage();
-  }
-  return rows;
+    if (joined) console.log(`background recovery joined ${joined} conversation(s).`);
+  })()
+    .catch((e) => console.warn('background recovery error:', e?.message || e))
+    .finally(() => {
+      recoveryInFlight = false;
+    });
 }
 
 /**
@@ -1357,6 +1387,9 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
   try {
     const rows = await listInboxConversations();
     const conversationSids = collapseConversations(rows);
+    // Kick off recovery of any unjoined historical threads without blocking the
+    // response; results appear on the next load.
+    maybeRunBackgroundRecovery();
     return res.json({ conversationSids });
   } catch (err) {
     console.error('List conversations error:', err);
