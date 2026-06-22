@@ -907,8 +907,12 @@ app.post(
       }
       rememberMirroredSid(messageSid);
     } catch (e) {
+      // Ack 200 even on failure: a 500 makes Twilio retry the status callback,
+      // and because the dedupe SID is only remembered after a fully successful
+      // mirror, a retry can create a duplicate Conversations row. The mirror is
+      // a display-only convenience, so dropping the retry is the safer trade.
       console.error('programmable-messaging mirror error:', e);
-      return res.status(500).send('Error');
+      return res.status(200).end();
     }
 
     res.status(200).end();
