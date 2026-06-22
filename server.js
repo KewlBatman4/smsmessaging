@@ -1404,6 +1404,64 @@ app.post('/api/conversations', requireSession, async (req, res) => {
 });
 
 /**
+ * POST /api/messages
+ * Send an outbound SMS to a customer (creating the conversation if needed) and
+ * optionally tag the contact with a display name + details. Used by automation
+ * (e.g. the recruiter pipeline) to text a candidate and label them "Recruitment".
+ *
+ * Body: { to: string, body: string, name?: string, details?: string }
+ * Auth: requireSession (Bearer session JWT from POST /api/login).
+ * Returns: { ok, conversationSid, to, created, label }
+ *
+ * The message is authored as the chat identity, exactly like the web app's
+ * conversation.sendMessage(), so Twilio relays it to the SMS participant.
+ */
+app.post('/api/messages', requireSession, async (req, res) => {
+  const phone = toE164Australian(req.body?.to);
+  if (!phone.ok) {
+    return res.status(400).json({ error: phone.error });
+  }
+  const body = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+  if (!body) {
+    return res.status(400).json({ error: 'Message body is required.' });
+  }
+
+  try {
+    const { conversationSid: sid, created } =
+      await findOrCreateConversationForCustomerAddress(phone.e164);
+
+    await twilioClient.conversations.v1
+      .services(serviceSid)
+      .conversations(sid)
+      .messages.create({ author: twilioChatIdentity, body });
+
+    // Optional contact label (name + free-text details, e.g. details: "Recruitment").
+    // Best-effort: a label failure must not fail an already-sent SMS.
+    let label = null;
+    const name = typeof req.body?.name === 'string' ? req.body.name : undefined;
+    const details = typeof req.body?.details === 'string' ? req.body.details : undefined;
+    if ((name && name.trim()) || (details && details.trim())) {
+      try {
+        label = upsertContactLabel(sid, { name, details });
+      } catch (labelErr) {
+        console.error('Send message: contact label write failed:', labelErr);
+      }
+    }
+
+    return res.status(created ? 201 : 200).json({
+      ok: true,
+      conversationSid: sid,
+      to: phone.e164,
+      created,
+      label,
+    });
+  } catch (err) {
+    console.error('Send message error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to send message.' });
+  }
+});
+
+/**
  * Studio-triggered inbound push fallback.
  * Use this from Twilio Studio on inbound message path to guarantee first-message alerts
  * even when Conversations post-event webhooks are delayed/missing for conversation creation.
