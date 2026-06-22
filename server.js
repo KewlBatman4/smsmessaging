@@ -1675,6 +1675,17 @@ app.post('/api/push/studio-inbound', async (req, res) => {
   }
 });
 
+/**
+ * /api/health is public (Railway healthcheck), so strip the customer-identifying
+ * `author` (inbound webhook author is the customer's phone number) from the webhook
+ * snapshots. Keep signatureValid/event/status/SIDs for diagnostics.
+ */
+function publicWebhookSnapshot(w) {
+  if (!w || typeof w !== 'object') return w;
+  const { author, ...rest } = w;
+  return { ...rest, hasAuthor: Boolean(author) };
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
@@ -1687,8 +1698,8 @@ app.get('/api/health', (_req, res) => {
     nativePushLastError,
     nativePushLastResult,
     nativePushLastFailures,
-    lastConversationsWebhook,
-    recentConversationsWebhooks,
+    lastConversationsWebhook: publicWebhookSnapshot(lastConversationsWebhook),
+    recentConversationsWebhooks: recentConversationsWebhooks.map(publicWebhookSnapshot),
   });
 });
 
