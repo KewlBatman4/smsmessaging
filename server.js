@@ -936,7 +936,9 @@ function requireSession(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
   try {
-    jwt.verify(token, sessionJwtSecret);
+    // Pin HS256 (the algorithm used by jwt.sign in /api/login) so a token
+    // cannot be presented under a different/weaker algorithm.
+    jwt.verify(token, sessionJwtSecret, { algorithms: ['HS256'] });
     next();
   } catch {
     return res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
