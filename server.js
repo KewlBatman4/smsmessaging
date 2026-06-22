@@ -1676,6 +1676,23 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error.' });
 });
 
-app.listen(PORT, () => {
+// Process-level safety net. A stray unhandled rejection would otherwise
+// terminate the process on Node 20+ (default --unhandled-rejections=throw),
+// dropping in-flight webhooks and all in-memory state on this single instance.
+// Log and keep serving for a rejection; exit on an uncaughtException (the
+// process is then in an undefined state) so Railway can restart cleanly.
+process.on('unhandledRejection', (err) => {
+  console.error('unhandledRejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err);
+  process.exit(1);
+});
+
+const server = app.listen(PORT, () => {
   console.log(`PBSG Messenger API listening on http://localhost:${PORT}`);
+});
+server.on('error', (err) => {
+  console.error('Failed to start HTTP server on port', PORT, '-', err?.message || err);
+  process.exit(1);
 });
