@@ -104,6 +104,13 @@ requireEnv();
 
 const twilioClient = twilio(apiKey, apiSecret, { accountSid });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
+if (!twilioAuthToken && !allowUnsignedWebhooks()) {
+  console.warn(
+    'WARNING: TWILIO_AUTH_TOKEN is not set — Twilio webhooks will be REJECTED (403) ' +
+      'until it is configured. Set it to your Twilio Account Auth Token (Console → Account Dashboard) ' +
+      'in Railway and your local .env. (Set ALLOW_UNSIGNED_WEBHOOKS=true for local dev only.)'
+  );
+}
 const pushSubscriptions = new Map();
 const nativePushTokens = new Set();
 let nativePushLastAttemptAt = null;
@@ -240,12 +247,26 @@ async function ensureChatParticipantInConversation(conversationSid) {
   }
 }
 
+/** Dev-only escape hatch: explicitly allow unsigned Twilio webhooks (local testing). */
+function allowUnsignedWebhooks() {
+  return ['true', '1', 'yes', 'on'].includes(
+    String(process.env.ALLOW_UNSIGNED_WEBHOOKS ?? '').toLowerCase()
+  );
+}
+
 function validateTwilioWebhookSignature(req) {
   if (!twilioAuthToken) {
-    console.warn(
-      'TWILIO_AUTH_TOKEN not set; Twilio webhook signature verification is disabled.'
-    );
-    return true;
+    // Fail CLOSED: without the Auth Token we cannot verify Twilio's signature,
+    // so an unsigned request from anyone could spam push / inject content.
+    // ALLOW_UNSIGNED_WEBHOOKS is the only (dev-only) way to bypass this.
+    if (allowUnsignedWebhooks()) {
+      console.warn(
+        'ALLOW_UNSIGNED_WEBHOOKS is set; skipping Twilio signature verification (dev only).'
+      );
+      return true;
+    }
+    console.error('TWILIO_AUTH_TOKEN not set; rejecting unsigned Twilio webhook.');
+    return false;
   }
   const sig = req.headers['x-twilio-signature'];
   if (!sig) return false;
