@@ -944,13 +944,19 @@ app.post(
       return res.status(200).type('text/xml').send('<Response></Response>');
     }
     const bodyText = typeof req.body.Body === 'string' ? req.body.Body : '';
-    const parsed = parseTrelloRelaySmsBody(bodyText);
-    if (parsed) {
-      appendTrelloRelayMessages(
-        parsed.customerE164,
-        parsed.fromBody,
-        parsed.replyBody
-      );
+    // Never 5xx a Twilio inbound-SMS webhook: a 500 makes Twilio retry the
+    // delivery. Log and swallow any parse/append error and still ack 200.
+    try {
+      const parsed = parseTrelloRelaySmsBody(bodyText);
+      if (parsed) {
+        appendTrelloRelayMessages(
+          parsed.customerE164,
+          parsed.fromBody,
+          parsed.replyBody
+        );
+      }
+    } catch (e) {
+      console.error('trello-relay parse error:', e?.message || e);
     }
     return res.status(200).type('text/xml').send('<Response></Response>');
   }
@@ -1419,7 +1425,15 @@ app.get('/api/trello-relay/thread', requireSession, (req, res) => {
   if (!raw || typeof raw !== 'string') {
     return res.status(400).json({ error: 'Missing customer (E.164).' });
   }
-  const c = canonicalCustomerE164(decodeURIComponent(raw.trim()));
+  let decoded;
+  try {
+    decoded = decodeURIComponent(raw.trim());
+  } catch {
+    // Malformed percent-encoding (e.g. a lone "%") otherwise throws URIError
+    // and surfaces as a 500 via the global handler.
+    return res.status(400).json({ error: 'Invalid customer phone.' });
+  }
+  const c = canonicalCustomerE164(decoded);
   if (!c) {
     return res.status(400).json({ error: 'Invalid customer phone.' });
   }
