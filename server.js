@@ -1600,7 +1600,15 @@ app.post('/api/messages', requireSession, async (req, res) => {
 app.post('/api/push/studio-inbound', async (req, res) => {
   try {
     const expectedSecret = String(process.env.STUDIO_PUSH_WEBHOOK_SECRET || '').trim();
-    if (expectedSecret) {
+    if (!expectedSecret) {
+      // Fail CLOSED: with no shared secret configured this endpoint could be
+      // used by anyone to spam push to all staff. ALLOW_UNSIGNED_WEBHOOKS is
+      // the only (dev-only) bypass.
+      if (!allowUnsignedWebhooks()) {
+        console.error('STUDIO_PUSH_WEBHOOK_SECRET not set; rejecting studio-inbound request.');
+        return res.status(403).json({ error: 'Forbidden.' });
+      }
+    } else {
       const gotSecret = String(req.headers['x-pbsg-studio-secret'] || '').trim();
       if (!gotSecret || gotSecret !== expectedSecret) {
         return res.status(403).json({ error: 'Forbidden.' });
