@@ -8,11 +8,12 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbsg-settings-'));
 process.env.CONTACT_LABELS_DIR = dir;
 const { readSettings, updateSettings } = await import('../lib/appSettings.js');
 
-test('defaults: hideRecruitment false + seeded templates', () => {
+test('defaults: hideRecruitment false + seeded templates + moderate volume', () => {
   const s = readSettings();
   assert.equal(s.hideRecruitment, false);
   assert.ok(Array.isArray(s.templates) && s.templates.length >= 1);
   assert.ok(s.templates.every((t) => t.id && typeof t.name === 'string' && typeof t.text === 'string'));
+  assert.equal(s.soundVolume, 0.7);
 });
 
 test('update hideRecruitment persists, coerces to boolean, keeps templates', () => {
@@ -36,9 +37,30 @@ test('templates: empty array is respected (user deleted all)', () => {
   assert.deepEqual(readSettings().templates, []);
 });
 
+test('soundVolume: save, clamp to [0,1], and round-trip; 0 = muted', () => {
+  updateSettings({ soundVolume: 0.42 });
+  assert.equal(readSettings().soundVolume, 0.42);
+  // clamps out-of-range
+  updateSettings({ soundVolume: 2 });
+  assert.equal(readSettings().soundVolume, 1);
+  updateSettings({ soundVolume: -3 });
+  assert.equal(readSettings().soundVolume, 0); // muted persists, not coerced to a default
+  // a soundVolume-only update leaves other keys alone
+  updateSettings({ hideRecruitment: true });
+  updateSettings({ soundVolume: 0.5 });
+  assert.equal(readSettings().hideRecruitment, true);
+  updateSettings({ hideRecruitment: false });
+});
+
+test('soundVolume: non-numeric input is ignored (keeps prior value)', () => {
+  updateSettings({ soundVolume: 0.33 });
+  updateSettings({ soundVolume: 'loud' });
+  assert.equal(readSettings().soundVolume, 0.33);
+});
+
 test('settings object only exposes known keys', () => {
   updateSettings({ hideRecruitment: true, evil: '__proto__' });
-  assert.deepEqual(Object.keys(readSettings()).sort(), ['hideRecruitment', 'templates']);
+  assert.deepEqual(Object.keys(readSettings()).sort(), ['hideRecruitment', 'soundVolume', 'templates']);
 });
 
 test('corrupt file falls back to defaults (non-critical)', () => {

@@ -1443,7 +1443,8 @@ app.get('/api/settings', requireSession, (_req, res) => {
 
 /**
  * PUT /api/settings
- * Body: { hideRecruitment?: boolean }
+ * Body: { hideRecruitment?: boolean, templates?: Array, soundVolume?: number(0..1) }
+ * Only keys present in the body are applied (partial update).
  */
 app.put('/api/settings', requireSession, (req, res) => {
   try {
@@ -1453,6 +1454,7 @@ app.put('/api/settings', requireSession, (req, res) => {
     const patch = {};
     if ('hideRecruitment' in body) patch.hideRecruitment = body.hideRecruitment;
     if ('templates' in body) patch.templates = body.templates;
+    if ('soundVolume' in body) patch.soundVolume = body.soundVolume;
     const settings = updateSettings(patch);
     return res.json({ ok: true, settings });
   } catch (err) {
