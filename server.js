@@ -57,6 +57,22 @@ const sessionMaxAgeSec = Number(process.env.SESSION_MAX_AGE_SECONDS) || 31536000
 /** Single Twilio chat identity for this inbox (alphanumeric + underscore/hyphen). */
 const twilioChatIdentity = (process.env.TWILIO_CONVERSATIONS_IDENTITY || 'pbsg-inbox').trim();
 
+/**
+ * Named staff accounts. All share APP_PASSWORD_HASH — the username only
+ * identifies WHO is signed in (to personalise message templates with their
+ * name). The inbox itself is shared across all accounts. Override with
+ * APP_USERS="Name1,Name2,…".
+ */
+const appUsers = (process.env.APP_USERS || 'Mylene,Matt')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+function resolveAppUser(username) {
+  const want = String(username || '').trim().toLowerCase();
+  if (!want) return null;
+  return appUsers.find((u) => u.toLowerCase() === want) || null;
+}
+
 function validateTwilioIdentity(identity) {
   if (!identity || identity.length < 1 || identity.length > 64) {
     return { ok: false, error: 'TWILIO_CONVERSATIONS_IDENTITY must be 1–64 characters.' };
@@ -1195,8 +1211,10 @@ function recordLoginFailure(ip) {
 
 /**
  * POST /api/login
- * Body: { password: string }
- * Returns a signed session JWT (store in browser; use as Bearer for /api/token and /api/conversations).
+ * Body: { password: string, username?: string }
+ * username is optional (legacy clients omit it). When supplied it must be a
+ * known staff name (appUsers); it is embedded in the JWT + returned so the UI
+ * can personalise templates. Returns a signed session JWT.
  */
 app.post('/api/login', async (req, res) => {
   const ip = req.ip || req.socket?.remoteAddress || 'unknown';
@@ -1210,6 +1228,7 @@ app.post('/api/login', async (req, res) => {
   if (!password || typeof password !== 'string') {
     return res.status(400).json({ error: 'Password is required.' });
   }
+  const usernameRaw = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
 
   try {
     const ok = await bcrypt.compare(password, appPasswordHash);
@@ -1217,15 +1236,26 @@ app.post('/api/login', async (req, res) => {
       recordLoginFailure(ip);
       return res.status(401).json({ error: 'Invalid credentials.' });
     }
+    // Password is correct; if a username was supplied it must be a known staff name.
+    let displayName = '';
+    if (usernameRaw) {
+      displayName = resolveAppUser(usernameRaw);
+      if (!displayName) {
+        return res
+          .status(401)
+          .json({ error: `Unknown user. Choose one of: ${appUsers.join(', ')}.` });
+      }
+    }
     loginFailures.delete(ip);
     const sessionToken = jwt.sign(
-      { v: 1 },
+      { v: 1, name: displayName || undefined },
       sessionJwtSecret,
-      { expiresIn: sessionMaxAgeSec, subject: 'pbsg' }
+      { expiresIn: sessionMaxAgeSec, subject: displayName ? displayName.toLowerCase() : 'pbsg' }
     );
     return res.json({
       token: sessionToken,
       expiresIn: sessionMaxAgeSec,
+      name: displayName,
     });
   } catch (err) {
     console.error('Login error:', err);
@@ -1417,7 +1447,13 @@ app.get('/api/settings', requireSession, (_req, res) => {
  */
 app.put('/api/settings', requireSession, (req, res) => {
   try {
-    const settings = updateSettings({ hideRecruitment: req.body?.hideRecruitment });
+    // Only apply keys the client actually sent (so a templates-only update does
+    // not reset hideRecruitment, and vice versa).
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const patch = {};
+    if ('hideRecruitment' in body) patch.hideRecruitment = body.hideRecruitment;
+    if ('templates' in body) patch.templates = body.templates;
+    const settings = updateSettings(patch);
     return res.json({ ok: true, settings });
   } catch (err) {
     console.error('Settings write error:', err);
