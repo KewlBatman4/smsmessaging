@@ -52,10 +52,17 @@ test('soundVolume: save, clamp to [0,1], and round-trip; 0 = muted', () => {
   updateSettings({ hideRecruitment: false });
 });
 
-test('soundVolume: non-numeric input is ignored (keeps prior value)', () => {
+test('soundVolume: non-numeric / coercible junk is ignored (never silently mutes/maxes)', () => {
   updateSettings({ soundVolume: 0.33 });
-  updateSettings({ soundVolume: 'loud' });
-  assert.equal(readSettings().soundVolume, 0.33);
+  // Each of these would Number()-coerce to 0 or 1 — they must be REJECTED so a
+  // malformed write cannot mute or max the shared setting for everyone.
+  for (const junk of ['loud', null, '', '   ', [], [0.5], false, true, {}, NaN, Infinity]) {
+    updateSettings({ soundVolume: junk });
+    assert.equal(readSettings().soundVolume, 0.33, `should ignore ${JSON.stringify(junk)}`);
+  }
+  // A numeric string is still accepted.
+  updateSettings({ soundVolume: '0.5' });
+  assert.equal(readSettings().soundVolume, 0.5);
 });
 
 test('settings object only exposes known keys', () => {
