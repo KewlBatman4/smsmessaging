@@ -20,6 +20,13 @@ import {
   upsertContactLabel,
 } from './lib/contactLabels.js';
 import { readSettings, updateSettings } from './lib/appSettings.js';
+import {
+  MISSED_CALL_MARKER_BODY,
+  evaluateMissedCall,
+  parseConversationAttributes,
+  withAutoSmsFields,
+  withMissedCallMarker,
+} from './lib/missedCall.js';
 
 const { AccessToken } = twilio.jwt;
 const { ChatGrant } = AccessToken;
@@ -1683,30 +1690,37 @@ app.post('/api/messages', requireSession, async (req, res) => {
 });
 
 /**
+ * Shared-secret check for Studio-facing endpoints. Studio's HTTP Request
+ * widget can't reliably send custom headers, so the secret is accepted either
+ * as the x-pbsg-studio-secret header OR a `secret` field in the request body.
+ * Fails CLOSED when STUDIO_PUSH_WEBHOOK_SECRET is unset (dev-only bypass:
+ * ALLOW_UNSIGNED_WEBHOOKS).
+ */
+function checkStudioSecret(req) {
+  const expected = String(process.env.STUDIO_PUSH_WEBHOOK_SECRET || '').trim();
+  if (!expected) {
+    return allowUnsignedWebhooks() ? { ok: true } : { ok: false, reason: 'secret_not_configured' };
+  }
+  const got = String(req.headers['x-pbsg-studio-secret'] || req.body?.secret || '').trim();
+  return got === expected ? { ok: true } : { ok: false, reason: 'bad_secret' };
+}
+
+/**
  * Studio-triggered inbound push fallback.
  * Use this from Twilio Studio on inbound message path to guarantee first-message alerts
  * even when Conversations post-event webhooks are delayed/missing for conversation creation.
  *
- * Optional header auth:
- *  - Set STUDIO_PUSH_WEBHOOK_SECRET in backend env
- *  - Send matching header x-pbsg-studio-secret from Studio HTTP Request widget
+ * Auth: STUDIO_PUSH_WEBHOOK_SECRET via x-pbsg-studio-secret header or `secret`
+ * body field (see checkStudioSecret).
  */
 app.post('/api/push/studio-inbound', async (req, res) => {
   try {
-    const expectedSecret = String(process.env.STUDIO_PUSH_WEBHOOK_SECRET || '').trim();
-    if (!expectedSecret) {
-      // Fail CLOSED: with no shared secret configured this endpoint could be
-      // used by anyone to spam push to all staff. ALLOW_UNSIGNED_WEBHOOKS is
-      // the only (dev-only) bypass.
-      if (!allowUnsignedWebhooks()) {
+    const auth = checkStudioSecret(req);
+    if (!auth.ok) {
+      if (auth.reason === 'secret_not_configured') {
         console.error('STUDIO_PUSH_WEBHOOK_SECRET not set; rejecting studio-inbound request.');
-        return res.status(403).json({ error: 'Forbidden.' });
       }
-    } else {
-      const gotSecret = String(req.headers['x-pbsg-studio-secret'] || '').trim();
-      if (!gotSecret || gotSecret !== expectedSecret) {
-        return res.status(403).json({ error: 'Forbidden.' });
-      }
+      return res.status(403).json({ error: 'Forbidden.' });
     }
     const conversationSid = String(req.body?.conversationSid || req.body?.ConversationSid || '');
     const messageSid = String(
@@ -1776,6 +1790,144 @@ app.post('/api/push/studio-inbound', async (req, res) => {
     return res.status(500).json({ error: 'Failed to send studio inbound push.', detail: err?.message || String(err) });
   }
 });
+
+/**
+ * Studio missed-call hook (POST /api/studio/missed-call).
+ *
+ * Called from the Twilio Studio voice flow after a call is missed and the AI
+ * follow-up text has been generated. In one request this:
+ *   1. Finds/creates the caller's conversation in the messenger.
+ *   2. Records a "📞 Missed call" marker authored by the CALLER, so it renders
+ *      as an inbound bubble (and fires the normal inbound push notification).
+ *   3. Sends `message` as the chat identity — Twilio relays it to the customer
+ *      as a real SMS and it renders as an outbound bubble — but AT MOST once
+ *      per customer in any rolling 7-day window. Guard state lives in the
+ *      conversation's attributes (not server memory) so it survives redeploys.
+ *      The guard is reserved BEFORE the send and rolled back if the send
+ *      fails; if the rollback itself fails the guard stays on — the safe
+ *      direction for "never twice in 7 days".
+ *
+ * Body (form-encoded or JSON): from (caller number), to?, callSid?, message,
+ * secret. A repeated callSid is a no-op (Studio double-fire protection).
+ * NOTE: the guard's read-check-write is not atomic, but one caller cannot end
+ * two calls at the same instant, and the Studio path waits ~15s before firing.
+ */
+app.post(
+  '/api/studio/missed-call',
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    try {
+      const auth = checkStudioSecret(req);
+      if (!auth.ok) {
+        if (auth.reason === 'secret_not_configured') {
+          console.error('STUDIO_PUSH_WEBHOOK_SECRET not set; rejecting missed-call request.');
+        }
+        return res.status(403).json({ error: 'Forbidden.' });
+      }
+      const fromRaw = String(req.body?.from || req.body?.From || '').trim();
+      const customerE164 = canonicalCustomerE164(fromRaw);
+      if (!customerE164) {
+        return res.status(400).json({ error: 'Invalid caller number.', from: fromRaw || null });
+      }
+      const callSid = String(req.body?.callSid || req.body?.CallSid || '').trim();
+      const message = String(req.body?.message || req.body?.Message || '').trim();
+
+      const { conversationSid } =
+        await findOrCreateConversationForCustomerAddress(customerE164);
+      await ensureChatParticipantInConversation(conversationSid);
+      const conversation = await twilioClient.conversations.v1
+        .services(serviceSid)
+        .conversations(conversationSid)
+        .fetch();
+
+      const now = Date.now();
+      const decision = evaluateMissedCall(conversation.attributes, { callSid, now });
+      if (decision.deduped) {
+        return res.json({
+          ok: true,
+          deduped: true,
+          conversationSid,
+          missedCallRecorded: false,
+          smsSent: false,
+        });
+      }
+
+      // Inbound-style marker authored by the caller. The author matches the SMS
+      // participant's binding address, so Twilio does NOT relay it back to the
+      // customer (same mechanism as the Studio inbound-SMS Author trick).
+      await twilioClient.conversations.v1
+        .services(serviceSid)
+        .conversations(conversationSid)
+        .messages.create({
+          author: customerE164,
+          body: MISSED_CALL_MARKER_BODY,
+          attributes: JSON.stringify({ pbsgMissedCall: true, callSid: callSid || null }),
+        });
+
+      const updateAttributes = (attrsObj) =>
+        twilioClient.conversations.v1
+          .services(serviceSid)
+          .conversations(conversationSid)
+          .update({ attributes: JSON.stringify(attrsObj) });
+      const markerAttrs = withMissedCallMarker(conversation.attributes, { callSid, now });
+
+      let smsSent = false;
+      let skipReason = decision.skipReason;
+      if (decision.canSendSms && message) {
+        const previous = parseConversationAttributes(conversation.attributes)?.pbsgMissedCall;
+        const reserved = withAutoSmsFields(markerAttrs, {
+          lastSentAt: new Date(now).toISOString(),
+          lastCallSid: callSid || null,
+        });
+        await updateAttributes(reserved);
+        try {
+          await twilioClient.conversations.v1
+            .services(serviceSid)
+            .conversations(conversationSid)
+            .messages.create({ author: twilioChatIdentity, body: message });
+          smsSent = true;
+        } catch (sendErr) {
+          console.error('missed-call auto-SMS send failed:', sendErr?.message || sendErr);
+          skipReason = 'sms_send_failed';
+          try {
+            await updateAttributes(
+              withAutoSmsFields(reserved, {
+                lastSentAt: previous?.autoSmsLastSentAt ?? null,
+                lastCallSid: previous?.autoSmsLastCallSid ?? null,
+              })
+            );
+          } catch (rollbackErr) {
+            // Guard stays reserved: the customer may miss ONE auto-SMS, but we
+            // never risk sending twice inside the window.
+            console.error(
+              'missed-call guard rollback failed (guard left on):',
+              rollbackErr?.message || rollbackErr
+            );
+          }
+        }
+      } else {
+        if (!skipReason && !message) skipReason = 'empty_message';
+        await updateAttributes(markerAttrs);
+      }
+
+      return res.json({
+        ok: true,
+        deduped: false,
+        conversationSid,
+        missedCallRecorded: true,
+        smsSent,
+        skipReason: skipReason || null,
+        nextAllowedAt: decision.nextAllowedAt,
+      });
+    } catch (err) {
+      console.error('Studio missed-call error:', err);
+      return res.status(500).json({
+        error: 'Failed to process missed call.',
+        detail: err?.message || String(err),
+      });
+    }
+  }
+);
 
 /**
  * /api/health is public (Railway healthcheck), so strip the customer-identifying
