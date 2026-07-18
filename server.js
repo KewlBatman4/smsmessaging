@@ -1018,7 +1018,9 @@ function requireSession(req, res, next) {
   try {
     // Pin HS256 (the algorithm used by jwt.sign in /api/login) so a token
     // cannot be presented under a different/weaker algorithm.
-    jwt.verify(token, sessionJwtSecret, { algorithms: ['HS256'] });
+    const session = jwt.verify(token, sessionJwtSecret, { algorithms: ['HS256'] });
+    req.sessionUserKey =
+      typeof session?.sub === 'string' && session.sub.trim() ? session.sub.trim() : 'pbsg';
     next();
   } catch {
     return res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
@@ -1430,11 +1432,12 @@ app.get('/api/conversation-sids', requireSession, async (_req, res) => {
 
 /**
  * GET /api/settings
- * Shared, server-side UI settings (apply to every browser/session).
+ * Server-side UI settings. Templates are scoped to the authenticated user;
+ * hideRecruitment remains shared across the team.
  */
-app.get('/api/settings', requireSession, (_req, res) => {
+app.get('/api/settings', requireSession, (req, res) => {
   try {
-    return res.json({ settings: readSettings() });
+    return res.json({ settings: readSettings(req.sessionUserKey) });
   } catch (err) {
     console.error('Settings read error:', err);
     return res.status(500).json({ error: 'Failed to load settings.' });
@@ -1455,7 +1458,7 @@ app.put('/api/settings', requireSession, (req, res) => {
     if ('hideRecruitment' in body) patch.hideRecruitment = body.hideRecruitment;
     if ('templates' in body) patch.templates = body.templates;
     if ('soundVolume' in body) patch.soundVolume = body.soundVolume;
-    const settings = updateSettings(patch);
+    const settings = updateSettings(patch, req.sessionUserKey);
     return res.json({ ok: true, settings });
   } catch (err) {
     console.error('Settings write error:', err);
